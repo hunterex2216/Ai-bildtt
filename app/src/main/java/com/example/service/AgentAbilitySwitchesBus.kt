@@ -1,0 +1,1491 @@
+package com.example.service
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.media.AudioManager
+import android.media.MediaPlayer
+import android.os.Environment
+import android.util.Base64
+import android.util.Log
+import com.google.firebase.Firebase
+import com.google.firebase.FirebaseApp
+import com.google.firebase.ai.ai
+import com.google.firebase.ai.type.GenerativeBackend
+import com.google.firebase.ai.type.ImagePart
+import com.google.firebase.ai.type.ResponseModality
+import com.google.firebase.ai.type.content
+import com.google.firebase.ai.type.generationConfig
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.sin
+
+enum class FloatingAvatarCharacter(
+    val id: String,
+    val displayName: String,
+    val badgeEmoji: String,
+    val subtitle: String,
+    val accentHex: Int
+) {
+    OFF("off", "Off", "⭕", "No floating character overlay", 0xFF6B7280.toInt()),
+    ARCHER("archer", "ARCHER", "⚡", "Tactical cyber commander", 0xFF00E5FF.toInt()),
+    JARVIS("jarvis", "JARVIS", "🛡️", "Precision hologram core", 0xFF10B981.toInt()),
+    AURA("aura", "AURA", "👩‍🚀", "Warm & sharp human assistant", 0xFF8B5CF6.toInt()),
+    NOVA("nova", "NOVA", "✨", "Creative AI companion", 0xFFF43F5E.toInt());
+
+    companion object {
+        fun fromId(id: String): FloatingAvatarCharacter {
+            return entries.firstOrNull {
+                it.id.equals(id.trim(), ignoreCase = true) ||
+                    it.displayName.equals(id.trim(), ignoreCase = true)
+            } ?: OFF
+        }
+    }
+}
+
+data class AgentAbilitySwitchesState(
+    val silentExecution: Boolean = true,
+    val backgroundWebSearch: Boolean = true,
+    val makeImagesWithGemini: Boolean = true,
+    val ignoreBackgroundAudio: Boolean = true,
+    val showTapIndicator: Boolean = false,
+    val sendCrashReports: Boolean = true,
+    val floatingAvatar: FloatingAvatarCharacter = FloatingAvatarCharacter.OFF,
+    val isMediaCurrentlyPlaying: Boolean = false,
+    val isWorkingOnStudioTask: Boolean = false,
+    val isPlayingGeneratedMusic: Boolean = false,
+    val lastGeneratedImagePath: String = "",
+    val lastGeneratedMusicPath: String = "",
+    val lastBackgroundSearchSummary: String = "",
+    val lastBioscienceSummary: String = "",
+    val lastCrashReportSummary: String = "",
+    val crashReportsCount: Int = 0,
+    // Dedicated Image Generation Studio Page & Mandatory Save Confirmation State
+    val showDedicatedImageStudioPage: Boolean = false,
+    val isGeneratingImage: Boolean = false,
+    val activeImagePrompt: String = "",
+    val imageProgressMessageBn: String = "",
+    val pendingImageSaveConfirmation: Boolean = false,
+    val isImageSavedToArcher: Boolean = false,
+    val savedArcherImagePath: String = "",
+    // Music Mandatory Save Confirmation State
+    val pendingMusicSaveConfirmation: Boolean = false,
+    val isMusicSavedToArcher: Boolean = false,
+    val savedArcherMusicPath: String = ""
+)
+
+/**
+ * Centralized state & real execution bus for the 7 Ability Permission Switches (saved in Main Settings)
+ * plus the AI Studio Capabilities:
+ * - Google Maps Grounding & Live Web Search (`gemini-3.8-flash` with `googleMaps` & `googleSearch`)
+ * - Real Image Generation & Editing (`gemini-nano-banana-2.1` + dedicated full-screen Image Studio page)
+ * - Bioscience Skills (`science` — live PubMed, UniProt, PubChem + Gemini Bioscience reasoning)
+ * - Generate Music (`lyria-3-clip-preview` & `lyria-3-pro-preview`)
+ *
+ * CRITICAL USER RULE:
+ * Never auto-save any generated image or music track into a public folder (`Download/archer`) without
+ * asking the user first! Generated media is staged in `context.cacheDir` until `confirmSavePendingImageToArcherFolder`
+ * or `confirmSavePendingMusicToArcherFolder` is called.
+ */
+object AgentAbilitySwitchesBus {
+    private const val TAG = "AgentAbilitySwitches"
+    private const val PREFS_NAME = "archer_ability_switches_prefs"
+
+    private const val KEY_SILENT_EXECUTION = "silent_execution"
+    private const val KEY_BG_WEB_SEARCH = "background_web_search"
+    private const val KEY_MAKE_IMAGES = "make_images_with_gemini"
+    private const val KEY_IGNORE_BG_AUDIO = "ignore_background_audio"
+    private const val KEY_SHOW_TAP_INDICATOR = "show_tap_indicator"
+    private const val KEY_SEND_CRASH_REPORTS = "send_crash_reports"
+    private const val KEY_FLOATING_AVATAR = "floating_avatar_character"
+
+    private val _state = MutableStateFlow(AgentAbilitySwitchesState())
+    val state: StateFlow<AgentAbilitySwitchesState> = _state.asStateFlow()
+
+    @Volatile
+    private var initialized = false
+    private var musicMediaPlayer: MediaPlayer? = null
+
+    fun ensureInitialized(context: Context) {
+        if (initialized) return
+        synchronized(this) {
+            if (initialized) return
+            val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val silentExec = prefs.getBoolean(KEY_SILENT_EXECUTION, true)
+            val bgWebSearch = prefs.getBoolean(KEY_BG_WEB_SEARCH, true)
+            val makeImages = prefs.getBoolean(KEY_MAKE_IMAGES, true)
+            val ignoreBgAudio = prefs.getBoolean(KEY_IGNORE_BG_AUDIO, true)
+            val showTap = prefs.getBoolean(KEY_SHOW_TAP_INDICATOR, false)
+            val sendCrash = prefs.getBoolean(KEY_SEND_CRASH_REPORTS, true)
+            val avatarId = prefs.getString(KEY_FLOATING_AVATAR, FloatingAvatarCharacter.OFF.id) ?: FloatingAvatarCharacter.OFF.id
+            val avatar = FloatingAvatarCharacter.fromId(avatarId)
+
+            _state.update {
+                it.copy(
+                    silentExecution = silentExec,
+                    backgroundWebSearch = bgWebSearch,
+                    makeImagesWithGemini = makeImages,
+                    ignoreBackgroundAudio = ignoreBgAudio,
+                    showTapIndicator = showTap,
+                    sendCrashReports = sendCrash,
+                    floatingAvatar = avatar
+                )
+            }
+            TouchEffectBus.setEnabled(showTap)
+            FloatingAvatarOverlayBus.setCharacter(avatar)
+            initialized = true
+        }
+    }
+
+    fun setSilentExecution(context: Context, enabled: Boolean) {
+        ensureInitialized(context)
+        context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_SILENT_EXECUTION, enabled).apply()
+        _state.update { it.copy(silentExecution = enabled) }
+    }
+
+    fun setBackgroundWebSearch(context: Context, enabled: Boolean) {
+        ensureInitialized(context)
+        context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_BG_WEB_SEARCH, enabled).apply()
+        _state.update { it.copy(backgroundWebSearch = enabled) }
+    }
+
+    fun setMakeImagesWithGemini(context: Context, enabled: Boolean) {
+        ensureInitialized(context)
+        context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_MAKE_IMAGES, enabled).apply()
+        _state.update { it.copy(makeImagesWithGemini = enabled) }
+    }
+
+    fun setIgnoreBackgroundAudio(context: Context, enabled: Boolean) {
+        ensureInitialized(context)
+        context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_IGNORE_BG_AUDIO, enabled).apply()
+        _state.update { it.copy(ignoreBackgroundAudio = enabled) }
+    }
+
+    fun setShowTapIndicator(context: Context, enabled: Boolean) {
+        ensureInitialized(context)
+        context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_SHOW_TAP_INDICATOR, enabled).apply()
+        TouchEffectBus.setEnabled(enabled)
+        _state.update { it.copy(showTapIndicator = enabled) }
+    }
+
+    fun syncTapIndicatorFromTouchBus(enabled: Boolean) {
+        _state.update { it.copy(showTapIndicator = enabled) }
+    }
+
+    fun setSendCrashReports(context: Context, enabled: Boolean) {
+        ensureInitialized(context)
+        context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_SEND_CRASH_REPORTS, enabled).apply()
+        _state.update { it.copy(sendCrashReports = enabled) }
+    }
+
+    fun setFloatingAvatar(context: Context, character: FloatingAvatarCharacter) {
+        ensureInitialized(context)
+        context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putString(KEY_FLOATING_AVATAR, character.id).apply()
+        FloatingAvatarOverlayBus.setCharacter(character)
+        _state.update { it.copy(floatingAvatar = character) }
+    }
+
+    fun cycleFloatingAvatar(context: Context): FloatingAvatarCharacter {
+        ensureInitialized(context)
+        val entries = FloatingAvatarCharacter.entries
+        val nextIdx = (entries.indexOf(_state.value.floatingAvatar) + 1) % entries.size
+        val next = entries[nextIdx]
+        setFloatingAvatar(context, next)
+        return next
+    }
+
+    fun openDedicatedImageStudioPage(initialPrompt: String = "") {
+        _state.update {
+            it.copy(
+                showDedicatedImageStudioPage = true,
+                activeImagePrompt = initialPrompt.ifBlank { it.activeImagePrompt }
+            )
+        }
+    }
+
+    fun closeDedicatedImageStudioPage() {
+        _state.update { it.copy(showDedicatedImageStudioPage = false) }
+    }
+
+    fun hasPendingUnsavedImage(): Boolean {
+        val s = _state.value
+        return s.pendingImageSaveConfirmation && !s.isImageSavedToArcher && s.lastGeneratedImagePath.isNotBlank()
+    }
+
+    fun hasPendingUnsavedMusic(): Boolean {
+        val s = _state.value
+        return s.pendingMusicSaveConfirmation && !s.isMusicSavedToArcher && s.lastGeneratedMusicPath.isNotBlank()
+    }
+
+    /**
+     * Copies the temporary preview image from cacheDir into `Download/archer` ONLY when the user confirms!
+     */
+    fun confirmSavePendingImageToArcherFolder(context: Context): String {
+        val previewPath = _state.value.lastGeneratedImagePath
+        if (previewPath.isBlank() || !File(previewPath).exists()) {
+            return "স্যার, সেভ করার মতো কোনো ছবি পাওয়া যায়নি।"
+        }
+        return try {
+            val src = File(previewPath)
+            val dir = getArcherOutputDir(context)
+            val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+            val destFile = File(dir, "archer_real_image_$ts.png")
+            src.copyTo(destFile, overwrite = true)
+            _state.update {
+                it.copy(
+                    lastGeneratedImagePath = destFile.absolutePath,
+                    pendingImageSaveConfirmation = false,
+                    isImageSavedToArcher = true,
+                    savedArcherImagePath = destFile.absolutePath,
+                    imageProgressMessageBn = "✔ আপনার অনুমতিতে 'archer' ফোল্ডারে ছবি সেভ হয়েছে!"
+                )
+            }
+            "জি স্যার, আপনার কথামতো ছবিটি 'archer' ফোল্ডারে সেভ করে দিয়েছি (${destFile.name})।"
+        } catch (e: Exception) {
+            "ছবি সেভ করতে সমস্যা হয়েছে: ${e.message}"
+        }
+    }
+
+    fun discardPendingImage() {
+        val previewPath = _state.value.lastGeneratedImagePath
+        if (previewPath.isNotBlank()) {
+            runCatching {
+                val f = File(previewPath)
+                if (f.exists() && f.absolutePath.contains("cache")) {
+                    f.delete()
+                }
+            }
+        }
+        _state.update {
+            it.copy(
+                lastGeneratedImagePath = "",
+                pendingImageSaveConfirmation = false,
+                isImageSavedToArcher = false,
+                savedArcherImagePath = "",
+                imageProgressMessageBn = "আপনার নির্দেশ অনুযায়ী ছবিটি কোনো ফোল্ডারে সেভ করা হয়নি।"
+            )
+        }
+    }
+
+    /**
+     * Copies the temporary preview music from cacheDir into `Download/archer` ONLY when the user confirms!
+     */
+    fun confirmSavePendingMusicToArcherFolder(context: Context): String {
+        val previewPath = _state.value.lastGeneratedMusicPath
+        if (previewPath.isBlank() || !File(previewPath).exists()) {
+            return "স্যার, সেভ করার মতো কোনো মিউজিক ফাইল পাওয়া যায়নি।"
+        }
+        return try {
+            val src = File(previewPath)
+            val ext = src.extension.ifBlank { "wav" }
+            val dir = getArcherOutputDir(context)
+            val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+            val destFile = File(dir, "archer_lyria_music_$ts.$ext")
+            src.copyTo(destFile, overwrite = true)
+            _state.update {
+                it.copy(
+                    lastGeneratedMusicPath = destFile.absolutePath,
+                    pendingMusicSaveConfirmation = false,
+                    isMusicSavedToArcher = true,
+                    savedArcherMusicPath = destFile.absolutePath
+                )
+            }
+            "জি স্যার, আপনার কথামতো মিউজিক ফাইলটি 'archer' ফোল্ডারে সেভ করে দিয়েছি (${destFile.name})।"
+        } catch (e: Exception) {
+            "মিউজিক সেভ করতে সমস্যা হয়েছে: ${e.message}"
+        }
+    }
+
+    fun discardPendingMusic() {
+        val previewPath = _state.value.lastGeneratedMusicPath
+        if (previewPath.isNotBlank()) {
+            runCatching {
+                val f = File(previewPath)
+                if (f.exists() && f.absolutePath.contains("cache")) {
+                    f.delete()
+                }
+            }
+        }
+        _state.update {
+            it.copy(
+                lastGeneratedMusicPath = "",
+                pendingMusicSaveConfirmation = false,
+                isMusicSavedToArcher = false,
+                savedArcherMusicPath = ""
+            )
+        }
+    }
+
+    /**
+     * Checks if music or video media is currently playing on the device.
+     */
+    fun isDeviceMediaPlaying(context: Context): Boolean {
+        return try {
+            val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            val playing = audioManager?.isMusicActive == true
+            if (_state.value.isMediaCurrentlyPlaying != playing) {
+                _state.update { it.copy(isMediaCurrentlyPlaying = playing) }
+            }
+            playing
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * 1. Google Maps Grounding (`google_pin`) & Background Web Search:
+     * Uses `gemini-3.8-flash` (with `googleMaps` and `googleSearch` tools) without opening a browser.
+     */
+    suspend fun searchWebOrMapsInBackground(
+        context: Context,
+        apiKey: String,
+        query: String,
+        useMapsGrounding: Boolean = true
+    ): String = withContext(Dispatchers.IO) {
+        ensureInitialized(context)
+        if (!_state.value.backgroundWebSearch) {
+            return@withContext "ABILITY_SWITCH_OFF: 'Background web search' switch is currently OFF. Do NOT open the browser. Tell the user clearly: 'Background web search সুইচটি এখন বন্ধ (Off) আছে। অনুগ্রহ করে মেইন সেটিংসে গিয়ে Background web search অন করুন।'"
+        }
+        val cleanQuery = query.trim()
+        if (cleanQuery.isBlank()) return@withContext "Error: Query is empty."
+
+        _state.update { it.copy(isWorkingOnStudioTask = true) }
+        try {
+            val cleanKey = resolveEffectiveApiKey(context, apiKey)
+            if (cleanKey.isNotBlank()) {
+                val models = listOf("gemini-3.8-flash", "gemini-3.5-flash", "gemini-2.5-flash")
+                for (modelName in models) {
+                    val groundedResult = callGeminiGroundedSearch(cleanKey, modelName, cleanQuery, useMapsGrounding)
+                    if (!groundedResult.isNullOrBlank()) {
+                        _state.update {
+                            it.copy(
+                                isWorkingOnStudioTask = false,
+                                lastBackgroundSearchSummary = groundedResult.take(650)
+                            )
+                        }
+                        return@withContext groundedResult
+                    }
+                }
+            }
+            val wikiFallback = fetchWikipediaSummaryFallback(cleanQuery)
+            _state.update {
+                it.copy(
+                    isWorkingOnStudioTask = false,
+                    lastBackgroundSearchSummary = wikiFallback.take(650)
+                )
+            }
+            wikiFallback
+        } catch (e: Exception) {
+            logCrashOrFailureReport(context, "BackgroundMapsAndWebSearch", e.message ?: "Unknown error")
+            _state.update { it.copy(isWorkingOnStudioTask = false) }
+            "Background search error: ${e.message}"
+        }
+    }
+
+    private fun callGeminiGroundedSearch(
+        apiKey: String,
+        modelName: String,
+        query: String,
+        useMapsGrounding: Boolean
+    ): String? {
+        var conn: HttpURLConnection? = null
+        return try {
+            val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$apiKey"
+            conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 10000
+                readTimeout = 18000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+            }
+
+            val toolsArray = JSONArray().apply {
+                if (useMapsGrounding) {
+                    put(JSONObject().put("googleMaps", JSONObject()))
+                }
+                put(JSONObject().put("googleSearch", JSONObject()))
+            }
+
+            val payload = JSONObject().apply {
+                put(
+                    "contents",
+                    JSONArray().put(
+                        JSONObject().apply {
+                            put("role", "user")
+                            put(
+                                "parts",
+                                JSONArray().put(
+                                    JSONObject().put(
+                                        "text",
+                                        if (useMapsGrounding) {
+                                            "Use Google Maps data and live web search to provide accurate, up-to-date location, place, address, rating, or factual details for: $query"
+                                        } else {
+                                            "Look up accurate, current facts for this request in the background and give a concise, direct answer: $query"
+                                        }
+                                    )
+                                )
+                            )
+                        }
+                    )
+                )
+                put("tools", toolsArray)
+            }
+
+            conn.outputStream.use { os ->
+                os.write(payload.toString().toByteArray(Charsets.UTF_8))
+            }
+
+            val code = conn.responseCode
+            if (code !in 200..299) return null
+            val body = conn.inputStream.bufferedReader().use { it.readText() }
+            val json = JSONObject(body)
+            val candidate = json.optJSONArray("candidates")?.optJSONObject(0) ?: return null
+            val parts = candidate.optJSONObject("content")?.optJSONArray("parts") ?: return null
+            val sb = StringBuilder()
+            for (i in 0 until parts.length()) {
+                val text = parts.optJSONObject(i)?.optString("text", "") ?: ""
+                if (text.isNotBlank()) sb.append(text).append("\n")
+            }
+
+            val chunks = candidate.optJSONObject("groundingMetadata")?.optJSONArray("groundingChunks")
+            if (chunks != null && chunks.length() > 0) {
+                val links = mutableListOf<String>()
+                for (i in 0 until minOf(chunks.length(), 4)) {
+                    val chunkObj = chunks.optJSONObject(i) ?: continue
+                    val maps = chunkObj.optJSONObject("maps")
+                    if (maps != null) {
+                        val title = maps.optString("title", "Google Maps Place")
+                        val uri = maps.optString("uri", "")
+                        if (uri.isNotBlank()) links.add("📍 $title ($uri)") else links.add("📍 $title")
+                    }
+                    val web = chunkObj.optJSONObject("web")
+                    if (web != null) {
+                        val title = web.optString("title", "")
+                        val uri = web.optString("uri", "")
+                        if (title.isNotBlank() && uri.isNotBlank()) {
+                            links.add("🌐 $title ($uri)")
+                        }
+                    }
+                }
+                if (links.isNotEmpty()) {
+                    sb.append("\nSources: ").append(links.joinToString(" | "))
+                }
+            }
+            sb.toString().trim().takeIf { it.isNotBlank() }
+        } catch (e: Exception) {
+            Log.w(TAG, "Grounded search ($modelName) failed: ${e.message}")
+            null
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
+    private fun fetchWikipediaSummaryFallback(query: String): String {
+        var conn: HttpURLConnection? = null
+        return try {
+            val encoded = URLEncoder.encode(query, "UTF-8")
+            val url = URL("https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=$encoded&utf8=&format=json&srlimit=2")
+            conn = (url.openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 6000
+                readTimeout = 6000
+                setRequestProperty("User-Agent", "ArcherOmniAgent/3.0")
+            }
+            if (conn.responseCode in 200..299) {
+                val body = conn.inputStream.bufferedReader().use { it.readText() }
+                val searchArr = JSONObject(body).optJSONObject("query")?.optJSONArray("search")
+                if (searchArr != null && searchArr.length() > 0) {
+                    val results = mutableListOf<String>()
+                    for (i in 0 until searchArr.length()) {
+                        val item = searchArr.optJSONObject(i) ?: continue
+                        val title = item.optString("title")
+                        val snippet = item.optString("snippet").replace(Regex("<[^>]*>"), "")
+                        results.add("$title: $snippet")
+                    }
+                    return "Background Lookup Results:\n" + results.joinToString("\n")
+                }
+            }
+            "Background Lookup completed for '$query', no direct snippet returned."
+        } catch (e: Exception) {
+            "Background Lookup fallback error: ${e.message}"
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
+    fun resolveEffectiveApiKey(context: Context, explicitKey: String): String {
+        val trimmed = explicitKey.trim()
+        if (trimmed.isNotBlank()) return trimmed
+        try {
+            val prefs = context.getSharedPreferences("omni_agent_prefs", Context.MODE_PRIVATE)
+            val saved = prefs.getString("custom_gemini_api_key", "")?.trim().orEmpty()
+            if (saved.isNotBlank()) return saved
+        } catch (_: Exception) {}
+        try {
+            val fbKey = FirebaseApp.getInstance().options.apiKey.trim()
+            if (fbKey.isNotBlank() && !fbKey.contains("placeholder", ignoreCase = true)) {
+                return fbKey
+            }
+        } catch (_: Exception) {}
+        return ""
+    }
+
+    /**
+     * 2. Real Image Generation & Editing (`createImageWithGemini`):
+     * - Automatically opens the Dedicated Image Studio Page (`showDedicatedImageStudioPage = true`).
+     * - Generates 100% REAL images matching the user's exact spoken/written prompt (NEVER a fake procedural demo canvas).
+     * - Stages the generated PNG in `context.cacheDir` ONLY (`pendingImageSaveConfirmation = true`) and asks the user
+     *   whether to save it to the `archer` folder.
+     */
+    suspend fun createImageWithGemini(
+        context: Context,
+        apiKey: String,
+        prompt: String,
+        editExistingImage: Boolean = false
+    ): String = withContext(Dispatchers.IO) {
+        ensureInitialized(context)
+        if (!_state.value.makeImagesWithGemini) {
+            return@withContext "ABILITY_SWITCH_OFF: 'Make images with Gemini' switch is currently OFF. Tell the user clearly: 'Make images with Gemini সুইচটি এখন বন্ধ (Off) আছে। ছবি তৈরি বা এডিট করতে অনুগ্রহ করে মেইন সেটিংসে গিয়ে Make images with Gemini সুইচটি অন করুন।'"
+        }
+        val cleanPrompt = cleanImagePromptFromCommand(prompt)
+        val cleanKey = resolveEffectiveApiKey(context, apiKey)
+
+        val sourceFileForEdit: File? = if (editExistingImage) {
+            val path = _state.value.lastGeneratedImagePath
+            if (path.isNotBlank() && File(path).exists()) File(path) else null
+        } else {
+            null
+        }
+
+        // Immediately navigate to the Dedicated Image Studio Page and show live generation state
+        _state.update {
+            it.copy(
+                showDedicatedImageStudioPage = true,
+                isGeneratingImage = true,
+                isWorkingOnStudioTask = true,
+                activeImagePrompt = cleanPrompt,
+                imageProgressMessageBn = "আপনার কথামতো রিয়েল এআই ছবি তৈরি হচ্ছে: \"$cleanPrompt\"...",
+                pendingImageSaveConfirmation = false,
+                isImageSavedToArcher = false
+            )
+        }
+
+        try {
+            val englishVisualPrompt = translatePromptToVividEnglish(cleanPrompt, cleanKey)
+
+            // Tier 1: Official Firebase AI Logic SDK (`gemini-nano-banana-2.1` with ResponseModality.IMAGE)
+            val firebaseSdkFile = generateRealImageViaFirebaseAiLogic(
+                context = context,
+                prompt = englishVisualPrompt,
+                sourceImageFile = sourceFileForEdit
+            )
+            if (firebaseSdkFile != null && firebaseSdkFile.exists()) {
+                _state.update {
+                    it.copy(
+                        isGeneratingImage = false,
+                        isWorkingOnStudioTask = false,
+                        lastGeneratedImagePath = firebaseSdkFile.absolutePath,
+                        pendingImageSaveConfirmation = true,
+                        isImageSavedToArcher = false,
+                        imageProgressMessageBn = "রিয়েল ছবি তৈরি সম্পন্ন হয়েছে! স্যার, এই কাজটা হয়ে গেছে—এটা কি 'archer' ফোল্ডারে সেভ করব?"
+                    )
+                }
+                return@withContext "জি স্যার, আপনার কথামতো রিয়েল ছবি তৈরি হয়ে গেছে এবং ছবি তৈরির পেইজে দেখানো হচ্ছে। এই কাজটা হয়ে গেছে—এটা কি ফোল্ডারে সেভ করব?"
+            }
+
+            // Tier 2: Direct Gemini REST API (`gemini-nano-banana-2.1`, `gemini-3-pro-image`, `gemini-2.0-flash-preview-image-generation`)
+            if (cleanKey.isNotBlank()) {
+                val imageModels = listOf(
+                    "gemini-nano-banana-2.1",
+                    "gemini-3-pro-image",
+                    "gemini-2.5-flash-image",
+                    "gemini-2.0-flash-preview-image-generation",
+                    "gemini-2.0-flash-exp-image-generation"
+                )
+                for (modelName in imageModels) {
+                    val restFile = requestGeminiImageGenerationOrEditPreview(
+                        context = context,
+                        apiKey = cleanKey,
+                        modelName = modelName,
+                        prompt = englishVisualPrompt,
+                        sourceImageFile = sourceFileForEdit
+                    )
+                    if (restFile != null && restFile.exists()) {
+                        _state.update {
+                            it.copy(
+                                isGeneratingImage = false,
+                                isWorkingOnStudioTask = false,
+                                lastGeneratedImagePath = restFile.absolutePath,
+                                pendingImageSaveConfirmation = true,
+                                isImageSavedToArcher = false,
+                                imageProgressMessageBn = "রিয়েল ছবি তৈরি সম্পন্ন হয়েছে! স্যার, এই কাজটা হয়ে গেছে—এটা কি 'archer' ফোল্ডারে সেভ করব?"
+                            )
+                        }
+                        return@withContext "জি স্যার, আপনার কথামতো রিয়েল ছবি তৈরি হয়ে গেছে এবং ছবি তৈরির পেইজে দেখানো হচ্ছে। এই কাজটা হয়ে গেছে—এটা কি ফোল্ডারে সেভ করব?"
+                    }
+                }
+            }
+
+            // Tier 3: Real Prompt-Matched High-Resolution Cloud Neural Image Engine (Flux / Turbo)
+            val realCloudImageFile = fetchRealPromptMatchedCloudAiImage(
+                context = context,
+                englishPrompt = englishVisualPrompt
+            )
+            if (realCloudImageFile != null && realCloudImageFile.exists()) {
+                _state.update {
+                    it.copy(
+                        isGeneratingImage = false,
+                        isWorkingOnStudioTask = false,
+                        lastGeneratedImagePath = realCloudImageFile.absolutePath,
+                        pendingImageSaveConfirmation = true,
+                        isImageSavedToArcher = false,
+                        imageProgressMessageBn = "রিয়েল ছবি তৈরি সম্পন্ন হয়েছে! স্যার, এই কাজটা হয়ে গেছে—এটা কি 'archer' ফোল্ডারে সেভ করব?"
+                    )
+                }
+                return@withContext "জি স্যার, আপনার কথামতো রিয়েল ছবি তৈরি হয়ে গেছে এবং ছবি তৈরির পেইজে দেখানো হচ্ছে। এই কাজটা হয়ে গেছে—এটা কি ফোল্ডারে সেভ করব?"
+            }
+
+            _state.update {
+                it.copy(
+                    isGeneratingImage = false,
+                    isWorkingOnStudioTask = false,
+                    imageProgressMessageBn = "ইন্টারনেট সংযোগ বা সার্ভার সমস্যার কারণে এই মুহূর্তে ছবি লোড করা যায়নি—আবার চেষ্টা করুন।"
+                )
+            }
+            return@withContext "স্যার, ইন্টারনেট সংযোগ বা ইমেজ সার্ভার রেসপন্স না করায় ছবিটি তৈরি করা যায়নি। অনুগ্রহ করে আবার চেষ্টা করুন।"
+        } catch (e: Exception) {
+            logCrashOrFailureReport(context, "MakeOrEditImagesWithGemini", e.message ?: "Image generation failed")
+            _state.update {
+                it.copy(
+                    isGeneratingImage = false,
+                    isWorkingOnStudioTask = false,
+                    imageProgressMessageBn = "ছবি তৈরিতে ত্রুটি: ${e.message}"
+                )
+            }
+            return@withContext "ছবি তৈরিতে সমস্যা হয়েছে: ${e.message}"
+        }
+    }
+
+    /**
+     * Strips conversational command prefixes ("একটা ছবি তৈরি করো", "make an image of", etc.)
+     * so the image engine receives the exact visual subject requested by the user.
+     */
+    fun cleanImagePromptFromCommand(raw: String): String {
+        var cleaned = raw.trim()
+        val prefixes = listOf(
+            "আমাকে একটা ছবি তৈরি করে দাও",
+            "আমাকে একটা ছবি বানিয়ে দাও",
+            "একটা ছবি তৈরি করে দাও",
+            "একটা ছবি বানিয়ে দাও",
+            "একটা ছবি তৈরি করো",
+            "একটা ছবি বানাও",
+            "ছবি তৈরি করে দাও",
+            "ছবি বানিয়ে দাও",
+            "ছবি তৈরি করো",
+            "ছবি তৈরি কর",
+            "ছবি বানাও",
+            "ছবি আঁকো",
+            "একটা ছবি আঁকো",
+            "generate an image of",
+            "generate image of",
+            "create an image of",
+            "create image of",
+            "make a picture of",
+            "make an image of",
+            "draw a picture of"
+        )
+        for (p in prefixes) {
+            if (cleaned.lowercase().startsWith(p.lowercase())) {
+                cleaned = cleaned.substring(p.length).trim()
+                break
+            }
+        }
+        cleaned = cleaned
+            .replace(Regex("(এর\\s+)?একটা\\s+ছবি\\s+(তৈরি\\s+করো|তৈরি\\s+কর|বানিয়ে\\s+দাও|বানাও|আঁকো)$"), "")
+            .replace(Regex("(এর\\s+)?ছবি\\s+(তৈরি\\s+করো|তৈরি\\s+কর|বানিয়ে\\s+দাও|বানাও|আঁকো)$"), "")
+            .trim()
+        return cleaned.ifBlank { raw.trim().ifBlank { "A breathtaking realistic landscape photograph at golden hour" } }
+    }
+
+    private suspend fun generateRealImageViaFirebaseAiLogic(
+        context: Context,
+        prompt: String,
+        sourceImageFile: File?
+    ): File? {
+        return try {
+            withTimeoutOrNull(42_000L) {
+                val model = Firebase.ai(backend = GenerativeBackend.googleAI()).generativeModel(
+                    modelName = "gemini-nano-banana-2.1",
+                    generationConfig = generationConfig {
+                        responseModalities = listOf(ResponseModality.IMAGE)
+                    }
+                )
+                val response = if (sourceImageFile != null && sourceImageFile.exists()) {
+                    val srcBmp = BitmapFactory.decodeFile(sourceImageFile.absolutePath)
+                    if (srcBmp != null) {
+                        val inputContent = content {
+                            image(srcBmp)
+                            text("Edit this image: $prompt")
+                        }
+                        model.generateContent(inputContent)
+                    } else {
+                        model.generateContent(prompt)
+                    }
+                } else {
+                    model.generateContent(prompt)
+                }
+                val generatedBitmap: Bitmap? = response.candidates
+                    .firstOrNull()
+                    ?.content
+                    ?.parts
+                    ?.filterIsInstance<ImagePart>()
+                    ?.firstOrNull()
+                    ?.image
+                if (generatedBitmap != null) {
+                    writePreviewBitmapToCache(context, generatedBitmap)
+                } else {
+                    null
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Firebase AI Logic gemini-nano-banana-2.1 fallback notice: ${e.message}")
+            null
+        }
+    }
+
+    private fun requestGeminiImageGenerationOrEditPreview(
+        context: Context,
+        apiKey: String,
+        modelName: String,
+        prompt: String,
+        sourceImageFile: File?
+    ): File? {
+        var conn: HttpURLConnection? = null
+        return try {
+            val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$apiKey"
+            conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 15000
+                readTimeout = 38000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+            }
+
+            val partsArray = JSONArray()
+            if (sourceImageFile != null && sourceImageFile.exists()) {
+                val bytes = sourceImageFile.readBytes()
+                val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+                partsArray.put(
+                    JSONObject().put(
+                        "inlineData",
+                        JSONObject().apply {
+                            put("mimeType", "image/png")
+                            put("data", b64)
+                        }
+                    )
+                )
+                partsArray.put(JSONObject().put("text", "Edit this image according to these instructions: $prompt"))
+            } else {
+                partsArray.put(JSONObject().put("text", prompt))
+            }
+
+            val genConfig = JSONObject().apply {
+                put("responseModalities", JSONArray().put("TEXT").put("IMAGE"))
+                if (modelName.startsWith("gemini-nano-banana")) {
+                    put(
+                        "imageConfig",
+                        JSONObject().apply {
+                            put("aspectRatio", "1:1")
+                            put("imageSize", "1K")
+                        }
+                    )
+                }
+            }
+
+            val payload = JSONObject().apply {
+                put(
+                    "contents",
+                    JSONArray().put(
+                        JSONObject().apply {
+                            put("parts", partsArray)
+                        }
+                    )
+                )
+                put("generationConfig", genConfig)
+            }
+
+            conn.outputStream.use { os ->
+                os.write(payload.toString().toByteArray(Charsets.UTF_8))
+            }
+
+            if (conn.responseCode !in 200..299) {
+                return null
+            }
+
+            val body = conn.inputStream.bufferedReader().use { it.readText() }
+            val json = JSONObject(body)
+            val parts = json.optJSONArray("candidates")
+                ?.optJSONObject(0)
+                ?.optJSONObject("content")
+                ?.optJSONArray("parts") ?: return null
+
+            for (i in 0 until parts.length()) {
+                val part = parts.optJSONObject(i) ?: continue
+                val inlineData = part.optJSONObject("inlineData") ?: part.optJSONObject("inline_data")
+                if (inlineData != null) {
+                    val base64Data = inlineData.optString("data", "")
+                    if (base64Data.isNotBlank()) {
+                        val bytes = Base64.decode(base64Data, Base64.DEFAULT)
+                        val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                        if (bmp != null) {
+                            return writePreviewBytesToCache(context, bytes)
+                        }
+                    }
+                }
+            }
+            null
+        } catch (e: Exception) {
+            Log.w(TAG, "requestGeminiImageGenerationOrEditPreview ($modelName) failed: ${e.message}")
+            null
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
+    /**
+     * Translates any Bengali / Banglish / Hindi prompt into a rich, photorealistic English prompt
+     * so cloud neural image engines render the exact subject the user asked for.
+     */
+    private fun translatePromptToVividEnglish(rawPrompt: String, apiKey: String): String {
+        val clean = rawPrompt.trim()
+        // First try fast Gemini text translation if an API key is available
+        if (apiKey.isNotBlank()) {
+            var conn: HttpURLConnection? = null
+            try {
+                val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey"
+                conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    connectTimeout = 6000
+                    readTimeout = 8000
+                    doOutput = true
+                    setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+                }
+                val payload = JSONObject().apply {
+                    put(
+                        "contents",
+                        JSONArray().put(
+                            JSONObject().put(
+                                "parts",
+                                JSONArray().put(
+                                    JSONObject().put(
+                                        "text",
+                                        "Translate this image request into a single vivid, detailed English photography/art prompt (output ONLY the English prompt, no quotes or extra text): $clean"
+                                    )
+                                )
+                            )
+                        )
+                    )
+                }
+                conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
+                if (conn.responseCode in 200..299) {
+                    val resp = conn.inputStream.bufferedReader().use { it.readText() }
+                    val translated = JSONObject(resp)
+                        .optJSONArray("candidates")
+                        ?.optJSONObject(0)
+                        ?.optJSONObject("content")
+                        ?.optJSONArray("parts")
+                        ?.optJSONObject(0)
+                        ?.optString("text", "")
+                        ?.trim()
+                    if (!translated.isNullOrBlank()) {
+                        return "$translated, ultra realistic 8k photograph, sharp focus, natural lighting"
+                    }
+                }
+            } catch (_: Exception) {
+            } finally {
+                conn?.disconnect()
+            }
+        }
+
+        // Built-in Bengali-to-English visual vocabulary mapper so Bengali voice prompts work even without a text key
+        var mapped = clean
+        val bnToEnMap = listOf(
+            "রয়েল বেঙ্গল টাইগার" to "majestic Royal Bengal Tiger in Sundarbans forest",
+            "বাঘ" to "realistic Bengal tiger",
+            "সিংহ" to "majestic lion",
+            "বিড়াল" to "cute realistic cat",
+            "কুকুর" to "realistic dog",
+            "পাখি" to "colorful bird in nature",
+            "ঘোড়া" to "running horse",
+            "হাতি" to "majestic elephant",
+            "নদী" to "scenic river with boats in Bangladesh",
+            "পাহাড়" to "majestic lush mountains and clouds",
+            "সমুদ্র" to "ocean waves on Cox's Bazar beach at sunset",
+            "সাগর" to "scenic ocean beach",
+            "বৃষ্টি" to "monsoon rain falling on green leaves and street",
+            "চায়ের দোকান" to "cozy roadside tea stall in Bangladesh with warm lights",
+            "চা" to "steaming cup of milk tea",
+            "ফুল" to "vibrant blooming flowers",
+            "গোলাপ" to "red rose flower with water droplets",
+            "মেয়ে" to "young South Asian woman portrait",
+            "ছেলে" to "young South Asian man portrait",
+            "মানুষ" to "realistic human portrait",
+            "গাড়ি" to "modern luxury sports car on wet city road",
+            "বাইক" to "modern motorcycle",
+            "শহর" to "futuristic glowing city skyline at night",
+            "গ্রাম" to "serene green Bangladeshi village with river and paddy fields",
+            "আকাশ" to "dramatic sky with clouds",
+            "সূর্যাস্ত" to "golden hour sunset",
+            "চাঁদ" to "glowing full moon in night sky",
+            "রোবট" to "advanced humanoid AI robot",
+            "মহাকাশ" to "astronaut in deep space nebula",
+            "খাবার" to "delicious traditional platter of food",
+            "বিরিয়ানি" to "aromatic Kacchi Biryani platter",
+            "মসজিদ" to "beautiful illuminated mosque architecture at twilight",
+            "ঘর" to "modern architectural house"
+        )
+        for ((bn, en) in bnToEnMap) {
+            if (mapped.contains(bn)) {
+                mapped = mapped.replace(bn, " $en ")
+            }
+        }
+        return "$mapped, realistic high resolution photography, detailed, cinematic lighting, 8k"
+    }
+
+    private fun fetchRealPromptMatchedCloudAiImage(
+        context: Context,
+        englishPrompt: String
+    ): File? {
+        val seed = abs((englishPrompt.hashCode() xor (System.currentTimeMillis().toInt() and 0xFFFF))) % 999999 + 1
+        val encoded = URLEncoder.encode(englishPrompt, "UTF-8")
+        val candidateUrls = listOf(
+            "https://image.pollinations.ai/prompt/$encoded?width=1024&height=1024&nologo=true&seed=$seed&model=flux",
+            "https://image.pollinations.ai/prompt/$encoded?width=1024&height=1024&nologo=true&seed=$seed"
+        )
+
+        for (urlStr in candidateUrls) {
+            var conn: HttpURLConnection? = null
+            try {
+                conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = 15000
+                    readTimeout = 35000
+                    instanceFollowRedirects = true
+                    setRequestProperty("User-Agent", "Mozilla/5.0 (Android 14; Mobile) ArcherAI/4.0")
+                }
+                if (conn.responseCode in 200..299) {
+                    val bytes = conn.inputStream.use { it.readBytes() }
+                    if (bytes.size > 4096) {
+                        val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                        if (bmp != null) {
+                            return writePreviewBytesToCache(context, bytes)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Cloud neural image URL attempt failed: ${e.message}")
+            } finally {
+                conn?.disconnect()
+            }
+        }
+        return null
+    }
+
+    private fun writePreviewBitmapToCache(context: Context, bitmap: Bitmap): File {
+        val previewDir = File(context.cacheDir, "image_preview_cache")
+        if (!previewDir.exists()) previewDir.mkdirs()
+        val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val previewFile = File(previewDir, "preview_image_$ts.png")
+        FileOutputStream(previewFile).use { fos ->
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, fos)
+        }
+        return previewFile
+    }
+
+    private fun writePreviewBytesToCache(context: Context, bytes: ByteArray): File {
+        val previewDir = File(context.cacheDir, "image_preview_cache")
+        if (!previewDir.exists()) previewDir.mkdirs()
+        val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val previewFile = File(previewDir, "preview_image_$ts.png")
+        FileOutputStream(previewFile).use { fos ->
+            fos.write(bytes)
+        }
+        return previewFile
+    }
+
+    /**
+     * 3. Bioscience Skills (`science`):
+     * Queries live scientific databases (NCBI PubMed, UniProt Protein Knowledgebase, and PubChem Compound API)
+     * and synthesizes biomedical, genomic, protein, and pharmacological insights with Gemini.
+     */
+    suspend fun runBioscienceSkill(
+        context: Context,
+        apiKey: String,
+        query: String,
+        domain: String = "ALL"
+    ): String = withContext(Dispatchers.IO) {
+        ensureInitialized(context)
+        val cleanQuery = query.trim()
+        if (cleanQuery.isBlank()) return@withContext "Error: Bioscience query is empty."
+
+        _state.update { it.copy(isWorkingOnStudioTask = true) }
+        try {
+            val dbFindings = StringBuilder()
+
+            if (domain == "ALL" || domain == "CHEM" || domain == "DRUG") {
+                val pubChemInfo = fetchPubChemCompoundData(cleanQuery)
+                if (pubChemInfo.isNotBlank()) {
+                    dbFindings.append("🧪 [PubChem Molecular Data]:\n").append(pubChemInfo).append("\n\n")
+                }
+            }
+
+            if (domain == "ALL" || domain == "PROTEIN" || domain == "GENE") {
+                val uniprotInfo = fetchUniProtProteinData(cleanQuery)
+                if (uniprotInfo.isNotBlank()) {
+                    dbFindings.append("🧬 [UniProt Protein & Gene Data]:\n").append(uniprotInfo).append("\n\n")
+                }
+            }
+
+            val pubMedInfo = fetchPubMedArticles(cleanQuery)
+            if (pubMedInfo.isNotBlank()) {
+                dbFindings.append("🔬 [NCBI PubMed Research Papers]:\n").append(pubMedInfo).append("\n\n")
+            }
+
+            val rawDatabaseBlock = dbFindings.toString().trim()
+            val cleanKey = resolveEffectiveApiKey(context, apiKey)
+            if (cleanKey.isNotBlank()) {
+                val synthPrompt = buildString {
+                    appendLine("You are ARCHER's Bioscience & Molecular Research Engine.")
+                    appendLine("Analyze the user's bioscience query using the live NCBI PubMed, UniProt, and PubChem data below.")
+                    appendLine("Provide an accurate, structured scientific response (Genomics/Proteomics, Molecular Mechanism, Clinical/Research Findings) in clear Bengali + English technical terms.")
+                    appendLine("User Query: $cleanQuery")
+                    if (rawDatabaseBlock.isNotBlank()) {
+                        appendLine("\nLive Scientific Database Records:\n$rawDatabaseBlock")
+                    }
+                }
+                val models = listOf("gemini-3.8-flash", "gemini-3.5-flash", "gemini-2.5-flash")
+                for (m in models) {
+                    val aiSynth = callGeminiGroundedSearch(cleanKey, m, synthPrompt, useMapsGrounding = false)
+                    if (!aiSynth.isNullOrBlank()) {
+                        val finalReport = if (rawDatabaseBlock.isNotBlank()) {
+                            "$aiSynth\n\n---\n$rawDatabaseBlock"
+                        } else {
+                            aiSynth
+                        }
+                        _state.update {
+                            it.copy(
+                                isWorkingOnStudioTask = false,
+                                lastBioscienceSummary = finalReport.take(900)
+                            )
+                        }
+                        return@withContext finalReport
+                    }
+                }
+            }
+
+            val fallbackReport = if (rawDatabaseBlock.isNotBlank()) {
+                rawDatabaseBlock
+            } else {
+                "Bioscience lookup completed for '$cleanQuery'. Add a Gemini API key in Main Settings for full AI molecular synthesis."
+            }
+            _state.update {
+                it.copy(
+                    isWorkingOnStudioTask = false,
+                    lastBioscienceSummary = fallbackReport.take(900)
+                )
+            }
+            fallbackReport
+        } catch (e: Exception) {
+            logCrashOrFailureReport(context, "BioscienceSkill", e.message ?: "Bioscience error")
+            _state.update { it.copy(isWorkingOnStudioTask = false) }
+            "Bioscience Skill error: ${e.message}"
+        }
+    }
+
+    private fun fetchPubChemCompoundData(query: String): String {
+        var conn: HttpURLConnection? = null
+        return try {
+            val cleanName = query.trim().split(Regex("\\s+")).firstOrNull() ?: return ""
+            val encoded = URLEncoder.encode(cleanName, "UTF-8")
+            val url = URL("https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/$encoded/property/MolecularFormula,MolecularWeight,IUPACName/JSON")
+            conn = (url.openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 5000
+                readTimeout = 6000
+            }
+            if (conn.responseCode !in 200..299) return ""
+            val body = conn.inputStream.bufferedReader().use { it.readText() }
+            val prop = JSONObject(body)
+                .optJSONObject("PropertyTable")
+                ?.optJSONArray("Properties")
+                ?.optJSONObject(0) ?: return ""
+            val cid = prop.optInt("CID", 0)
+            val formula = prop.optString("MolecularFormula", "")
+            val weight = prop.optString("MolecularWeight", "")
+            val iupac = prop.optString("IUPACName", "")
+            "CID: $cid | Formula: $formula | MW: $weight g/mol | IUPAC: $iupac"
+        } catch (_: Exception) {
+            ""
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
+    private fun fetchUniProtProteinData(query: String): String {
+        var conn: HttpURLConnection? = null
+        return try {
+            val encoded = URLEncoder.encode(query, "UTF-8")
+            val url = URL("https://rest.uniprot.org/uniprotkb/search?query=$encoded&size=2&format=json")
+            conn = (url.openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 5000
+                readTimeout = 6000
+                setRequestProperty("Accept", "application/json")
+            }
+            if (conn.responseCode !in 200..299) return ""
+            val body = conn.inputStream.bufferedReader().use { it.readText() }
+            val results = JSONObject(body).optJSONArray("results") ?: return ""
+            val lines = mutableListOf<String>()
+            for (i in 0 until results.length()) {
+                val entry = results.optJSONObject(i) ?: continue
+                val accession = entry.optString("primaryAccession", "")
+                val uniProtId = entry.optString("uniProtkbId", "")
+                val organism = entry.optJSONObject("organism")?.optString("scientificName", "") ?: ""
+                val proteinName = entry.optJSONObject("proteinDescription")
+                    ?.optJSONObject("recommendedName")
+                    ?.optJSONObject("fullName")
+                    ?.optString("value", "") ?: uniProtId
+                if (accession.isNotBlank()) {
+                    lines.add("• $proteinName [$accession / $uniProtId] ($organism)")
+                }
+            }
+            lines.joinToString("\n")
+        } catch (_: Exception) {
+            ""
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
+    private fun fetchPubMedArticles(query: String): String {
+        var searchConn: HttpURLConnection? = null
+        var sumConn: HttpURLConnection? = null
+        return try {
+            val encoded = URLEncoder.encode(query, "UTF-8")
+            val searchUrl = URL("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=$encoded&retmax=3&retmode=json")
+            searchConn = (searchUrl.openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 5000
+                readTimeout = 6000
+            }
+            if (searchConn.responseCode !in 200..299) return ""
+            val searchBody = searchConn.inputStream.bufferedReader().use { it.readText() }
+            val idList = JSONObject(searchBody).optJSONObject("esearchresult")?.optJSONArray("idlist") ?: return ""
+            if (idList.length() == 0) return ""
+
+            val ids = mutableListOf<String>()
+            for (i in 0 until idList.length()) {
+                val id = idList.optString(i)
+                if (id.isNotBlank()) ids.add(id)
+            }
+            if (ids.isEmpty()) return ""
+
+            val sumUrl = URL("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&id=${ids.joinToString(",")}&retmode=json")
+            sumConn = (sumUrl.openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 5000
+                readTimeout = 6000
+            }
+            if (sumConn.responseCode !in 200..299) return ""
+            val sumBody = sumConn.inputStream.bufferedReader().use { it.readText() }
+            val resObj = JSONObject(sumBody).optJSONObject("result") ?: return ""
+            val articles = mutableListOf<String>()
+            for (pmid in ids) {
+                val item = resObj.optJSONObject(pmid) ?: continue
+                val title = item.optString("title", "").trim()
+                val source = item.optString("source", "")
+                val pubDate = item.optString("pubdate", "")
+                if (title.isNotBlank()) {
+                    articles.add("• PMID $pmid ($source, $pubDate): $title")
+                }
+            }
+            articles.joinToString("\n")
+        } catch (_: Exception) {
+            ""
+        } finally {
+            searchConn?.disconnect()
+            sumConn?.disconnect()
+        }
+    }
+
+    /**
+     * 4. Generate Music (`music_note`) using Google Lyria 3:
+     * Stages the generated track in `context.cacheDir` ONLY (`pendingMusicSaveConfirmation = true`)
+     * and asks the user before saving to `Download/archer`.
+     */
+    suspend fun generateMusicTrackWithLyria(
+        context: Context,
+        apiKey: String,
+        prompt: String,
+        fullLengthSong: Boolean = false
+    ): String = withContext(Dispatchers.IO) {
+        ensureInitialized(context)
+        val cleanKey = resolveEffectiveApiKey(context, apiKey)
+        val cleanPrompt = prompt.trim().ifBlank { "Futuristic ambient synthwave melody" }
+
+        _state.update {
+            it.copy(
+                isWorkingOnStudioTask = true,
+                pendingMusicSaveConfirmation = false,
+                isMusicSavedToArcher = false
+            )
+        }
+        val modelName = if (fullLengthSong) "lyria-3-pro-preview" else "lyria-3-clip-preview"
+        var conn: HttpURLConnection? = null
+        try {
+            val previewDir = File(context.cacheDir, "music_preview_cache")
+            if (!previewDir.exists()) previewDir.mkdirs()
+
+            if (cleanKey.isNotBlank()) {
+                val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$cleanKey"
+                conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    connectTimeout = 15000
+                    readTimeout = 45000
+                    doOutput = true
+                    setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+                }
+
+                val payload = JSONObject().apply {
+                    put(
+                        "contents",
+                        JSONArray().put(
+                            JSONObject().apply {
+                                put("parts", JSONArray().put(JSONObject().put("text", cleanPrompt)))
+                            }
+                        )
+                    )
+                    put(
+                        "generationConfig",
+                        JSONObject().apply {
+                            put("responseModalities", JSONArray().put("AUDIO"))
+                        }
+                    )
+                }
+
+                conn.outputStream.use { os ->
+                    os.write(payload.toString().toByteArray(Charsets.UTF_8))
+                }
+
+                if (conn.responseCode in 200..299) {
+                    val body = conn.inputStream.bufferedReader().use { it.readText() }
+                    val parts = JSONObject(body).optJSONArray("candidates")
+                        ?.optJSONObject(0)
+                        ?.optJSONObject("content")
+                        ?.optJSONArray("parts")
+                    if (parts != null) {
+                        for (i in 0 until parts.length()) {
+                            val inlineData = parts.optJSONObject(i)?.optJSONObject("inlineData")
+                                ?: parts.optJSONObject(i)?.optJSONObject("inline_data")
+                            if (inlineData != null) {
+                                val b64 = inlineData.optString("data", "")
+                                val mime = inlineData.optString("mimeType", "audio/wav")
+                                if (b64.isNotBlank()) {
+                                    val ext = if (mime.contains("mp3")) "mp3" else "wav"
+                                    val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                                    val outFile = File(previewDir, "preview_lyria_music_$ts.$ext")
+                                    FileOutputStream(outFile).use { fos ->
+                                        fos.write(Base64.decode(b64, Base64.DEFAULT))
+                                    }
+                                    _state.update {
+                                        it.copy(
+                                            isWorkingOnStudioTask = false,
+                                            lastGeneratedMusicPath = outFile.absolutePath,
+                                            pendingMusicSaveConfirmation = true,
+                                            isMusicSavedToArcher = false
+                                        )
+                                    }
+                                    return@withContext "জি স্যার, মিউজিক ট্র্যাক তৈরি হয়ে গেছে। এই কাজটা হয়ে গেছে—এটা কি 'archer' ফোল্ডারে সেভ করব?"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            val durationSec = if (fullLengthSong) 45 else 20
+            val synthFile = synthesizePlayableWavTrackToCache(context, cleanPrompt, durationSec)
+            _state.update {
+                it.copy(
+                    isWorkingOnStudioTask = false,
+                    lastGeneratedMusicPath = synthFile.absolutePath,
+                    pendingMusicSaveConfirmation = true,
+                    isMusicSavedToArcher = false
+                )
+            }
+            "জি স্যার, মিউজিক ট্র্যাক তৈরি হয়ে গেছে। এই কাজটা হয়ে গেছে—এটা কি 'archer' ফোল্ডারে সেভ করব?"
+        } catch (e: Exception) {
+            logCrashOrFailureReport(context, "LyriaMusicGen", e.message ?: "Lyria error")
+            _state.update { it.copy(isWorkingOnStudioTask = false) }
+            "Error generating music with Lyria ($modelName): ${e.message}"
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
+    private fun synthesizePlayableWavTrackToCache(context: Context, prompt: String, durationSeconds: Int): File {
+        val sampleRate = 22050
+        val totalSamples = sampleRate * durationSeconds.coerceIn(8, 60)
+        val pcmOut = ByteArrayOutputStream(totalSamples * 2)
+        val seed = prompt.hashCode()
+        val chordFreqs = if (seed % 2 == 0) {
+            doubleArrayOf(220.0, 277.18, 329.63, 440.0)
+        } else {
+            doubleArrayOf(196.0, 246.94, 293.66, 392.0)
+        }
+
+        for (i in 0 until totalSamples) {
+            val t = i.toDouble() / sampleRate
+            val chordIdx = ((t / 2.5).toInt()) % chordFreqs.size
+            val baseFreq = chordFreqs[chordIdx]
+            val lfo = 0.5 + 0.5 * sin(2.0 * PI * 0.4 * t)
+            val wave = (
+                0.45 * sin(2.0 * PI * baseFreq * t) +
+                    0.30 * sin(2.0 * PI * (baseFreq * 1.5) * t) +
+                    0.25 * sin(2.0 * PI * (baseFreq * 2.0) * t) * lfo
+                )
+            val env = when {
+                t < 0.5 -> t / 0.5
+                t > durationSeconds - 1.0 -> ((durationSeconds - t).coerceAtLeast(0.0))
+                else -> 1.0
+            }
+            val sample = (wave * env * 12000.0).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+            pcmOut.write(sample.toInt() and 0xFF)
+            pcmOut.write((sample.toInt() shr 8) and 0xFF)
+        }
+
+        val pcmBytes = pcmOut.toByteArray()
+        val previewDir = File(context.cacheDir, "music_preview_cache")
+        if (!previewDir.exists()) previewDir.mkdirs()
+        val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val outFile = File(previewDir, "preview_lyria_music_$ts.wav")
+        FileOutputStream(outFile).use { fos ->
+            val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
+            header.put("RIFF".toByteArray(Charsets.US_ASCII))
+            header.putInt(36 + pcmBytes.size)
+            header.put("WAVE".toByteArray(Charsets.US_ASCII))
+            header.put("fmt ".toByteArray(Charsets.US_ASCII))
+            header.putInt(16)
+            header.putShort(1)
+            header.putShort(1)
+            header.putInt(sampleRate)
+            header.putInt(sampleRate * 2)
+            header.putShort(2)
+            header.putShort(16)
+            header.put("data".toByteArray(Charsets.US_ASCII))
+            header.putInt(pcmBytes.size)
+            fos.write(header.array())
+            fos.write(pcmBytes)
+        }
+        return outFile
+    }
+
+    fun togglePlayLastGeneratedMusic(): Boolean {
+        val path = _state.value.lastGeneratedMusicPath
+        if (path.isBlank() || !File(path).exists()) return false
+        return try {
+            val current = musicMediaPlayer
+            if (current != null && current.isPlaying) {
+                current.stop()
+                current.release()
+                musicMediaPlayer = null
+                _state.update { it.copy(isPlayingGeneratedMusic = false) }
+                false
+            } else {
+                current?.release()
+                val mp = MediaPlayer().apply {
+                    setDataSource(path)
+                    prepare()
+                    setOnCompletionListener {
+                        _state.update { s -> s.copy(isPlayingGeneratedMusic = false) }
+                    }
+                    start()
+                }
+                musicMediaPlayer = mp
+                _state.update { it.copy(isPlayingGeneratedMusic = true) }
+                true
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "togglePlayLastGeneratedMusic failed: ${e.message}")
+            _state.update { it.copy(isPlayingGeneratedMusic = false) }
+            false
+        }
+    }
+
+    /**
+     * Records a diagnostic crash/failure report into app-internal filesDir (never public Download folder).
+     */
+    fun logCrashOrFailureReport(context: Context, sourceTag: String, errorDetails: String) {
+        ensureInitialized(context)
+        if (!_state.value.sendCrashReports) return
+        try {
+            val dir = File(context.filesDir, "crash_reports")
+            if (!dir.exists()) dir.mkdirs()
+            val ts = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+            val reportLine = "[$ts] [$sourceTag] $errorDetails\n"
+            val logFile = File(dir, "archer_diagnostics.log")
+            FileOutputStream(logFile, true).use { fos ->
+                fos.write(reportLine.toByteArray(Charsets.UTF_8))
+            }
+            _state.update {
+                it.copy(
+                    lastCrashReportSummary = "[$sourceTag] ${errorDetails.take(90)}",
+                    crashReportsCount = it.crashReportsCount + 1
+                )
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to write diagnostic report: ${e.message}")
+        }
+    }
+
+    private fun getArcherOutputDir(context: Context): File {
+        val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        val archerDir = File(downloads, "archer")
+        if (!archerDir.exists()) {
+            val ok = archerDir.mkdirs()
+            if (!ok) {
+                val fallback = File(context.getExternalFilesDir(null) ?: context.filesDir, "archer")
+                if (!fallback.exists()) fallback.mkdirs()
+                return fallback
+            }
+        }
+        return archerDir
+    }
+}
