@@ -1,11 +1,16 @@
 package com.example.ui.components
 
+import android.accounts.AccountManager
+import android.app.Activity
 import android.graphics.BitmapFactory
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -22,9 +27,11 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Key
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
@@ -33,7 +40,6 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -54,14 +60,19 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.service.AgentAbilitySwitchesBus
+import com.example.service.PremiumImageModelTier
 import kotlinx.coroutines.launch
 import java.io.File
 
 /**
  * Dedicated Full-Screen Image Generation Studio Page:
- * Automatically opens whenever image generation is triggered from the main screen (voice or text)
- * or from the UI. Shows live generation progress, displays the real prompt-matched image,
- * and asks the user for explicit confirmation before saving to the `archer` folder.
+ * - Automatically opens whenever image generation is triggered from the main screen (voice or text)
+ *   or from the UI.
+ * - Supports Nano Banana Pro (`gemini-3-pro-image-preview`), Imagen 4.0 Ultra (`imagen-4.0-ultra-generate-001`),
+ *   Imagen 4.0 Pro (`imagen-4.0-generate-001`), and Nano Banana 2.1 (`gemini-2.5-flash-image`) with Auto-Routing.
+ * - Provides both Paid/Premium API Key setup AND Main Gmail Account Sign-In so users with premium access
+ *   can unlock all highest-tier models.
+ * - Stages generated images in preview first and asks for explicit confirmation before saving to `archer`.
  */
 @Composable
 fun DedicatedImageStudioOverlay(
@@ -82,6 +93,28 @@ fun DedicatedImageStudioOverlay(
         mutableStateOf(state.activeImagePrompt)
     }
 
+    var showPremiumAccessSheet by remember { mutableStateOf(false) }
+    var premiumKeyInput by remember(state.premiumImageApiKey, apiKey) {
+        mutableStateOf(state.premiumImageApiKey.ifBlank { apiKey })
+    }
+    var gmailInput by remember(state.connectedGmailAccount) {
+        mutableStateOf(state.connectedGmailAccount)
+    }
+
+    // System Google Account Picker for 1-Tap Main Gmail Sign-In
+    val googleAccountPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val pickedEmail = result.data?.getStringExtra(AccountManager.KEY_ACCOUNT_NAME)?.trim().orEmpty()
+            if (pickedEmail.isNotBlank()) {
+                gmailInput = pickedEmail
+                val msg = AgentAbilitySwitchesBus.connectMainGmailForPremium(context, pickedEmail)
+                onStatusSpoken(msg)
+            }
+        }
+    }
+
     val decodedBitmap = remember(state.lastGeneratedImagePath) {
         val path = state.lastGeneratedImagePath
         if (path.isNotBlank() && File(path).exists()) {
@@ -94,6 +127,7 @@ fun DedicatedImageStudioOverlay(
     val accentPink = Color(0xFFF43F5E)
     val accentCyan = Color(0xFF00E5FF)
     val accentGreen = Color(0xFF00FF9C)
+    val accentGold = Color(0xFFFFD54F)
 
     Column(
         modifier = Modifier
@@ -140,14 +174,14 @@ fun DedicatedImageStudioOverlay(
                 }
                 Column {
                     Text(
-                        text = "ARCHER REAL IMAGE STUDIO",
-                        color = accentPink,
-                        fontSize = 11.sp,
+                        text = "NANO BANANA PRO • IMAGEN 4 ULTRA STUDIO",
+                        color = accentGold,
+                        fontSize = 10.sp,
                         fontWeight = FontWeight.ExtraBold,
                         fontFamily = FontFamily.Monospace
                     )
                     Text(
-                        text = "রিয়েল এআই ছবি তৈরির আলাদা পেইজ",
+                        text = "প্রিমিয়াম রিয়েল ছবি তৈরির স্টুডিও",
                         color = Color.White,
                         fontSize = 15.sp,
                         fontWeight = FontWeight.Bold
@@ -175,7 +209,319 @@ fun DedicatedImageStudioOverlay(
             }
         }
 
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(10.dp))
+
+        // Premium Model Selector & Gmail / API Key Status Bar
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(14.dp))
+                .background(Color(0xFF0C1426))
+                .border(1.dp, accentGold.copy(alpha = 0.45f), RoundedCornerShape(14.dp))
+                .padding(11.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "⚡ অ্যাক্টিভ প্রিমিয়াম মডেল: ${state.selectedImageModelTier.badgeLabel}",
+                        color = accentGold,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                    Text(
+                        text = state.selectedImageModelTier.subtitleBn,
+                        color = Color(0xFFCBD5E1),
+                        fontSize = 10.sp
+                    )
+                }
+
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(
+                            if (state.isGmailPremiumLinked || state.premiumImageApiKey.isNotBlank() || apiKey.isNotBlank())
+                                accentGreen.copy(alpha = 0.16f)
+                            else
+                                accentGold.copy(alpha = 0.18f)
+                        )
+                        .border(
+                            1.dp,
+                            if (state.isGmailPremiumLinked || state.premiumImageApiKey.isNotBlank() || apiKey.isNotBlank())
+                                accentGreen
+                            else
+                                accentGold,
+                            RoundedCornerShape(8.dp)
+                        )
+                        .clickable { showPremiumAccessSheet = !showPremiumAccessSheet }
+                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                        .testTag("btn_toggle_premium_gmail_api_panel")
+                ) {
+                    Text(
+                        text = when {
+                            state.isGmailPremiumLinked -> "✔ Gmail: ${state.connectedGmailAccount.substringBefore("@")}"
+                            state.premiumImageApiKey.isNotBlank() || apiKey.isNotBlank() -> "🔑 PRO KEY ACTIVE"
+                            else -> "🔑 Gmail / API লগইন"
+                        },
+                        color = if (state.isGmailPremiumLinked || state.premiumImageApiKey.isNotBlank() || apiKey.isNotBlank())
+                            accentGreen
+                        else
+                            accentGold,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // Horizontal Scrollable Model Tier Pills
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                PremiumImageModelTier.entries.forEach { tier ->
+                    val isSelected = state.selectedImageModelTier == tier
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(9.dp))
+                            .background(
+                                if (isSelected) accentPink.copy(alpha = 0.25f) else Color(0xFF141E33)
+                            )
+                            .border(
+                                width = if (isSelected) 1.5.dp else 1.dp,
+                                color = if (isSelected) accentPink else Color.White.copy(alpha = 0.15f),
+                                shape = RoundedCornerShape(9.dp)
+                            )
+                            .clickable {
+                                AgentAbilitySwitchesBus.setSelectedImageModelTier(context, tier)
+                            }
+                            .padding(horizontal = 10.dp, vertical = 6.dp)
+                            .testTag("pill_image_model_${tier.id}")
+                    ) {
+                        Text(
+                            text = tier.badgeLabel,
+                            color = if (isSelected) Color.White else Color(0xFF94A3B8),
+                            fontSize = 10.sp,
+                            fontWeight = if (isSelected) FontWeight.ExtraBold else FontWeight.SemiBold
+                        )
+                    }
+                }
+            }
+
+            // Expandable Main Gmail Sign-In + Paid API Key Panel
+            if (showPremiumAccessSheet) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(Color(0xFF070C18))
+                        .border(1.dp, accentCyan.copy(alpha = 0.45f), RoundedCornerShape(12.dp))
+                        .padding(11.dp)
+                        .testTag("panel_premium_gmail_and_api_key")
+                ) {
+                    Text(
+                        text = "🌟 প্রিমিয়াম মডেল (Nano Banana Pro ও Imagen 4 Ultra) কানেকশন:",
+                        color = accentCyan,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                    Text(
+                        text = "• আপনার প্রিমিয়াম API Key থাকলে নিচে বসান — সাথে সাথে Nano Banana Pro (gemini-3-pro-image-preview) ও Imagen 4.0 Ultra অটো-রাউটিং হবে।\n• অথবা আপনার মেইন জিমেইল (Gmail ID) লগইন করে প্রিমিয়াম সুবিধা চালু করুন।",
+                        color = Color(0xFFCBD5E1),
+                        fontSize = 10.sp,
+                        modifier = Modifier.padding(top = 3.dp)
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    // Option 1: Main Gmail Account Login
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.AccountCircle,
+                            contentDescription = "Main Gmail",
+                            tint = accentGreen,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Text(
+                            text = "১. মেইন জিমেইল আইডি (Main Gmail Sign-In):",
+                            color = Color.White,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(5.dp))
+                    OutlinedTextField(
+                        value = gmailInput,
+                        onValueChange = { gmailInput = it },
+                        placeholder = {
+                            Text(
+                                "আপনার প্রিমিয়াম জিমেইল (যেমন: yourname@gmail.com)",
+                                color = Color.White.copy(alpha = 0.4f),
+                                fontSize = 11.sp
+                            )
+                        },
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            focusedBorderColor = accentGreen,
+                            unfocusedBorderColor = accentGreen.copy(alpha = 0.35f),
+                            cursorColor = accentGreen
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("input_main_gmail_account")
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(accentGreen.copy(alpha = 0.22f))
+                                .border(1.dp, accentGreen, RoundedCornerShape(8.dp))
+                                .clickable {
+                                    // If user hasn't typed an email yet, try launching system Google Account picker first
+                                    if (gmailInput.isBlank()) {
+                                        runCatching {
+                                            val pickIntent = AccountManager.newChooseAccountIntent(
+                                                null,
+                                                null,
+                                                arrayOf("com.google"),
+                                                null,
+                                                null,
+                                                null,
+                                                null
+                                            )
+                                            googleAccountPickerLauncher.launch(pickIntent)
+                                        }.onFailure {
+                                            val msg = "জিমেইল বক্সে আপনার মেইন Gmail আইডি লিখে ট্যাপ করুন।"
+                                            onStatusSpoken(msg)
+                                        }
+                                    } else {
+                                        val msg = AgentAbilitySwitchesBus.connectMainGmailForPremium(context, gmailInput)
+                                        onStatusSpoken(msg)
+                                    }
+                                }
+                                .padding(vertical = 9.dp)
+                                .testTag("btn_connect_main_gmail"),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = if (gmailInput.isBlank()) "📲 ফোনের মেইন Gmail সিলেক্ট করুন" else "✔ এই Gmail দিয়ে লগইন করুন",
+                                color = accentGreen,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.ExtraBold
+                            )
+                        }
+
+                        if (state.isGmailPremiumLinked) {
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(Color(0xFF2B1218))
+                                    .border(1.dp, Color(0xFFFF4D6A), RoundedCornerShape(8.dp))
+                                    .clickable {
+                                        gmailInput = ""
+                                        AgentAbilitySwitchesBus.disconnectMainGmail(context)
+                                    }
+                                    .padding(horizontal = 12.dp, vertical = 9.dp)
+                                    .testTag("btn_disconnect_main_gmail"),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = "লগআউট",
+                                    color = Color(0xFFFF8A9E),
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    // Option 2: Paid / Premium Gemini API Key
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Key,
+                            contentDescription = "Premium API Key",
+                            tint = accentGold,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Text(
+                            text = "২. প্রিমিয়াম Gemini API Key (Nano Banana Pro & Imagen 4):",
+                            color = Color.White,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(5.dp))
+                    OutlinedTextField(
+                        value = premiumKeyInput,
+                        onValueChange = { premiumKeyInput = it },
+                        placeholder = {
+                            Text(
+                                "AIzaSy... আপনার প্রিমিয়াম API Key বসান",
+                                color = Color.White.copy(alpha = 0.4f),
+                                fontSize = 11.sp
+                            )
+                        },
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            focusedBorderColor = accentGold,
+                            unfocusedBorderColor = accentGold.copy(alpha = 0.35f),
+                            cursorColor = accentGold
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("input_premium_image_api_key")
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(accentGold.copy(alpha = 0.22f))
+                            .border(1.dp, accentGold, RoundedCornerShape(8.dp))
+                            .clickable {
+                                val msg = AgentAbilitySwitchesBus.savePremiumApiKey(context, premiumKeyInput)
+                                onStatusSpoken(msg)
+                            }
+                            .padding(vertical = 9.dp)
+                            .testTag("btn_save_premium_image_api_key"),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = "🔑 প্রিমিয়াম API Key সেভ ও অ্যাক্টিভ করুন",
+                            color = accentGold,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.ExtraBold
+                        )
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
 
         // Prompt Input & Action Controls on the Dedicated Page
         Column(
@@ -239,7 +585,7 @@ fun DedicatedImageStudioOverlay(
                             scope.launch {
                                 val res = AgentAbilitySwitchesBus.createImageWithGemini(
                                     context = context,
-                                    apiKey = apiKey,
+                                    apiKey = state.premiumImageApiKey.ifBlank { apiKey },
                                     prompt = targetPrompt,
                                     editExistingImage = false
                                 )
@@ -251,9 +597,9 @@ fun DedicatedImageStudioOverlay(
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
-                        text = if (state.isGeneratingImage) "⏳ তৈরি হচ্ছে..." else "🎨 রিয়েল ছবি তৈরি করুন",
+                        text = if (state.isGeneratingImage) "⏳ প্রিমিয়াম মডেলে তৈরি হচ্ছে..." else "🎨 রিয়েল ছবি তৈরি করুন (${state.selectedImageModelTier.badgeLabel})",
                         color = Color.White,
-                        fontSize = 12.sp,
+                        fontSize = 11.sp,
                         fontWeight = FontWeight.ExtraBold
                     )
                 }
@@ -270,7 +616,7 @@ fun DedicatedImageStudioOverlay(
                                 scope.launch {
                                     val res = AgentAbilitySwitchesBus.createImageWithGemini(
                                         context = context,
-                                        apiKey = apiKey,
+                                        apiKey = state.premiumImageApiKey.ifBlank { apiKey },
                                         prompt = targetPrompt,
                                         editExistingImage = true
                                     )
@@ -309,7 +655,7 @@ fun DedicatedImageStudioOverlay(
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(350.dp)
+                .height(340.dp)
                 .clip(RoundedCornerShape(16.dp))
                 .background(Color(0xFF080D1A))
                 .border(
@@ -332,9 +678,9 @@ fun DedicatedImageStudioOverlay(
                             modifier = Modifier.size(54.dp)
                         )
                         Text(
-                            text = "রিয়েল এআই ছবি তৈরি হচ্ছে...",
+                            text = "${state.selectedImageModelTier.badgeLabel} দিয়ে রিয়েল ছবি তৈরি হচ্ছে...",
                             color = Color.White,
-                            fontSize = 15.sp,
+                            fontSize = 14.sp,
                             fontWeight = FontWeight.Bold
                         )
                         Text(
@@ -355,12 +701,32 @@ fun DedicatedImageStudioOverlay(
                 }
 
                 decodedBitmap != null -> {
-                    Image(
-                        bitmap = decodedBitmap,
-                        contentDescription = state.activeImagePrompt.ifBlank { "Generated Real AI Image" },
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier.fillMaxSize()
-                    )
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        Image(
+                            bitmap = decodedBitmap,
+                            contentDescription = state.activeImagePrompt.ifBlank { "Generated Real AI Image" },
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                        if (state.lastUsedImageModelName.isNotBlank()) {
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.TopStart)
+                                    .padding(10.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(Color(0xCC060913))
+                                    .border(1.dp, accentGold.copy(alpha = 0.7f), RoundedCornerShape(8.dp))
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                            ) {
+                                Text(
+                                    text = "⚡ ${state.lastUsedImageModelName}",
+                                    color = accentGold,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                    }
                 }
 
                 else -> {
@@ -375,7 +741,7 @@ fun DedicatedImageStudioOverlay(
                         )
                         Text(
                             text = state.imageProgressMessageBn.ifBlank {
-                                "আপনি যেকোনো ছবির কথা বললে বা উপরে লিখে ট্যাপ করলে এখানে সাথে সাথে রিয়েল ছবি তৈরি হবে।"
+                                "আপনি যেকোনো ছবির কথা বললে বা উপরে লিখে ট্যাপ করলে Nano Banana Pro ও Imagen 4 Ultra দিয়ে সাথে সাথে রিয়েল ছবি তৈরি হবে।"
                             },
                             color = Color(0xFF94A3B8),
                             fontSize = 12.sp

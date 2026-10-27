@@ -207,6 +207,11 @@ class MultimodalLiveService(
         namedToolHandler = handler
     }
 
+    private var onUserTurnCompleteForMemory: ((userUtterance: String, aiReply: String) -> Unit)? = null
+    fun setOnUserTurnCompleteForMemory(listener: (userUtterance: String, aiReply: String) -> Unit) {
+        onUserTurnCompleteForMemory = listener
+    }
+
     fun queueTurnBeforeStart(textPayload: String?) {
         pendingTextTurn = textPayload?.takeIf { it.isNotBlank() }
     }
@@ -504,6 +509,17 @@ class MultimodalLiveService(
         listOf("decision")
     )
 
+    private fun saveUserMemoryDecl() = toolDecl(
+        "save_user_memory",
+        "Save any important user fact, personal detail, preference, contact/family info, routine, project, password/code note, or explicit 'মনে রাখো / remember this' instruction into Sir's permanent Long-Term Memory (Memory Tab). Use BOTH when Sir explicitly tells you to remember something AND automatically whenever you detect an important personal fact or preference worth remembering!",
+        listOf(
+            "title" to "Short clear title in Bengali or English (e.g. 'স্যারের প্রিয় খাবার', 'অফিসের ঠিকানা', 'ভাইয়ের নাম্বার')",
+            "content" to "The complete important fact, instruction, or detail to remember permanently",
+            "category" to "One of: EXPLICIT_USER_MEMORY, PERSONAL_PROFILE, IMPORTANT_CONTACT, ROUTINE_SCHEDULE, WORK_PROJECT, SECRET_REFERENCE, USER_PREFERENCE"
+        ),
+        listOf("title", "content")
+    )
+
     fun currentApiKey(): String =
         Regex("key=([^&]+)").find(_state.value.exportConfig.fullWebsocketUrlWithKey)?.groupValues?.get(1).orEmpty()
 
@@ -562,7 +578,7 @@ class MultimodalLiveService(
                         put("required", JSONArray().put("action"))
                     })
                 }
-            ).put(installAppDecl()).put(backgroundWebSearchDecl()).put(makeImageWithGeminiDecl()).put(bioscienceSkillDecl()).put(generateMusicLyriaDecl()).put(setAbilitySwitchDecl()).put(confirmPendingSaveDecl()).put(appControlDecl()).put(writeCodeDecl()).put(sendGeneratedFileDecl()).put(workflowPlaybookDecl()).put(uiMemoryDecl()).put(findAppDecl()).put(deepThinkDecl()).put(proactiveWatchDecl()).put(switchPersonalityDecl()).put(switchVoiceOrMicPowerDecl()).put(powerOffSelfDecl()).put(understandAppOrWebsiteDecl()).put(selfHealOrUpdateDecl()))))
+            ).put(installAppDecl()).put(backgroundWebSearchDecl()).put(makeImageWithGeminiDecl()).put(bioscienceSkillDecl()).put(generateMusicLyriaDecl()).put(setAbilitySwitchDecl()).put(confirmPendingSaveDecl()).put(saveUserMemoryDecl()).put(appControlDecl()).put(writeCodeDecl()).put(sendGeneratedFileDecl()).put(workflowPlaybookDecl()).put(uiMemoryDecl()).put(findAppDecl()).put(deepThinkDecl()).put(proactiveWatchDecl()).put(switchPersonalityDecl()).put(switchVoiceOrMicPowerDecl()).put(powerOffSelfDecl()).put(understandAppOrWebsiteDecl()).put(selfHealOrUpdateDecl()))))
             put("inputAudioTranscription", JSONObject())
             put("outputAudioTranscription", JSONObject())
         })
@@ -1431,6 +1447,9 @@ class MultimodalLiveService(
                 toolCalledInCurrentTurn = false
                 userTurnBuf.setLength(0)
                 modelTurnBuf.setLength(0)
+                if (finalUser.isNotBlank()) {
+                    onUserTurnCompleteForMemory?.invoke(finalUser, finalModel)
+                }
                 if (finalModel.isNotBlank()) {
                     if (!hadPcmAudio && !_state.value.isSpeakerMuted) {
                         onLiveSpokenChunkOrReply(finalModel, true)
@@ -1809,8 +1828,9 @@ class MultimodalLiveService(
                - CODING & WRITING (`write_code`): When Sir asks you to write any code, website, app, script, or text document, call `write_code(title, file_name, language, code)`.
                - MANDATORY SAVE CONFIRMATION RULE (কখনও নিজে থেকে ফোল্ডারে সেভ করবে না): Whenever you finish creating an image (`make_image_with_gemini`), writing code/text (`write_code`), or generating music (`generate_music_lyria`), it is staged in preview ONLY and NOT saved to any folder yet! You MUST ask Sir first: "স্যার, এই কাজটা হয়ে গেছে—এটা কি ফোল্ডারে সেভ করব?" When Sir says "হ্যাঁ সেভ করো" / "সেভ করো", call `confirm_pending_save(decision="SAVE")`. When Sir says "না লাগবে না" / "বাদ দাও", call `confirm_pending_save(decision="DISCARD")`.
                - SENDING FILES (`send_generated_file`): When Sir asks to send/share a generated file or `.zip` archive to someone, call `send_generated_file(recipient="...", file_name="...", send_as_zip="false", caption="...")`.
-            6. SUPER-POWERFUL MAIN SYSTEM SELF-UPDATE (`self_heal_or_update`):
+            6. SUPER-POWERFUL MAIN SYSTEM SELF-UPDATE (`self_heal_or_update`) & SMART AUTO-MEMORY (`save_user_memory`):
                - Whenever Sir asks you to update yourself, change how your main system works, or promote any new rule/feature ("নিজেকে আপডেট করো", "মেইন সিস্টেম আপডেট করো", "আমি যেটা বলব সেটাই আপডেট হবে"), immediately call `self_heal_or_update(mode="INSTALL_UPDATE", title="...", specification="...")` so the directive is promoted straight into your Main Core System at highest priority!
+               - SMART AUTO-MEMORY (`save_user_memory`): Whenever Sir explicitly says "মনে রাখো", "মনে রাখবে", "remember this", "মাথায় রাখো", OR whenever Sir mentions any important personal fact, preference, family/friend name, phone number, address, schedule/routine, or work/project detail during conversation, you MUST immediately call `save_user_memory(title="...", content="...", category="...")` so it is permanently saved in the Memory Tab and remembered across all future sessions!
             7. ACCURATE MESSAGING, YOUTUBE & VOICE/POWER-OFF:
                - When asked to message someone, ALWAYS separate `target="<contact>"` and `extra="<clean message>"` in `phone_action(action="WHATSAPP_AUTOMATION", target="...", extra="...")`.
                - For YouTube ("ইউটিউবে মটু পাতলু চালাও"), call `phone_action(action="OPEN_APP", target="YouTube", extra="মটু পাতলু")`.

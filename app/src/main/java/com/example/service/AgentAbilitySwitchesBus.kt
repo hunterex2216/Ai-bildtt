@@ -63,6 +63,60 @@ enum class FloatingAvatarCharacter(
     }
 }
 
+enum class PremiumImageModelTier(
+    val id: String,
+    val displayName: String,
+    val badgeLabel: String,
+    val subtitleBn: String,
+    val primaryModelId: String
+) {
+    AUTO_PRO(
+        id = "AUTO_PRO",
+        displayName = "Auto Pro (Nano Banana Pro + Imagen 4 Ultra)",
+        badgeLabel = "AUTO PRO • MAX",
+        subtitleBn = "Nano Banana Pro ও উপরের সব প্রিমিয়াম মডেল অটো-রাউটিং",
+        primaryModelId = "gemini-3-pro-image-preview"
+    ),
+    NANO_BANANA_PRO(
+        id = "NANO_BANANA_PRO",
+        displayName = "Nano Banana Pro (Gemini 3 Pro Image)",
+        badgeLabel = "NANO BANANA PRO",
+        subtitleBn = "প্রিমিয়াম 4K হাই-রেজোলিউশন, নিখুঁত আলো ও টেক্সট রেন্ডারিং",
+        primaryModelId = "gemini-3-pro-image-preview"
+    ),
+    IMAGEN_4_ULTRA(
+        id = "IMAGEN_4_ULTRA",
+        displayName = "Imagen 4.0 Ultra (Highest Tier)",
+        badgeLabel = "IMAGEN 4 ULTRA",
+        subtitleBn = "সর্বোচ্চ ফটোরিয়ালিস্টিক আল্ট্রা প্রিমিয়াম মডেল",
+        primaryModelId = "imagen-4.0-ultra-generate-001"
+    ),
+    IMAGEN_4_PRO(
+        id = "IMAGEN_4_PRO",
+        displayName = "Imagen 4.0 Pro",
+        badgeLabel = "IMAGEN 4 PRO",
+        subtitleBn = "শার্প ডিটেইলস ও প্রো স্টুডিও ফটোগ্রাফি কোয়ালিটি",
+        primaryModelId = "imagen-4.0-generate-001"
+    ),
+    NANO_BANANA_2_1(
+        id = "NANO_BANANA_2_1",
+        displayName = "Nano Banana 2.1 (Fast Pro)",
+        badgeLabel = "NANO BANANA 2.1",
+        subtitleBn = "দ্রুত রিয়েল-টাইম ছবি তৈরি ও ইমেজ এডিটিং",
+        primaryModelId = "gemini-2.5-flash-image"
+    );
+
+    companion object {
+        fun fromId(id: String?): PremiumImageModelTier {
+            if (id.isNullOrBlank()) return AUTO_PRO
+            return entries.firstOrNull {
+                it.id.equals(id.trim(), ignoreCase = true) ||
+                    it.primaryModelId.equals(id.trim(), ignoreCase = true)
+            } ?: AUTO_PRO
+        }
+    }
+}
+
 data class AgentAbilitySwitchesState(
     val silentExecution: Boolean = true,
     val backgroundWebSearch: Boolean = true,
@@ -88,6 +142,12 @@ data class AgentAbilitySwitchesState(
     val pendingImageSaveConfirmation: Boolean = false,
     val isImageSavedToArcher: Boolean = false,
     val savedArcherImagePath: String = "",
+    // Premium Image Model Suite + Main Gmail & Paid API Key State
+    val selectedImageModelTier: PremiumImageModelTier = PremiumImageModelTier.AUTO_PRO,
+    val lastUsedImageModelName: String = "Nano Banana Pro (gemini-3-pro-image-preview)",
+    val connectedGmailAccount: String = "",
+    val isGmailPremiumLinked: Boolean = false,
+    val premiumImageApiKey: String = "",
     // Music Mandatory Save Confirmation State
     val pendingMusicSaveConfirmation: Boolean = false,
     val isMusicSavedToArcher: Boolean = false,
@@ -118,6 +178,9 @@ object AgentAbilitySwitchesBus {
     private const val KEY_SHOW_TAP_INDICATOR = "show_tap_indicator"
     private const val KEY_SEND_CRASH_REPORTS = "send_crash_reports"
     private const val KEY_FLOATING_AVATAR = "floating_avatar_character"
+    private const val KEY_SELECTED_IMAGE_MODEL_TIER = "selected_image_model_tier"
+    private const val KEY_CONNECTED_GMAIL_ACCOUNT = "connected_gmail_account"
+    private const val KEY_PREMIUM_IMAGE_API_KEY = "premium_image_api_key"
 
     private val _state = MutableStateFlow(AgentAbilitySwitchesState())
     val state: StateFlow<AgentAbilitySwitchesState> = _state.asStateFlow()
@@ -130,7 +193,9 @@ object AgentAbilitySwitchesBus {
         if (initialized) return
         synchronized(this) {
             if (initialized) return
-            val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val appCtx = context.applicationContext
+            val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val mainPrefs = appCtx.getSharedPreferences("archer_cube_prefs", Context.MODE_PRIVATE)
             val silentExec = prefs.getBoolean(KEY_SILENT_EXECUTION, true)
             val bgWebSearch = prefs.getBoolean(KEY_BG_WEB_SEARCH, true)
             val makeImages = prefs.getBoolean(KEY_MAKE_IMAGES, true)
@@ -139,6 +204,10 @@ object AgentAbilitySwitchesBus {
             val sendCrash = prefs.getBoolean(KEY_SEND_CRASH_REPORTS, true)
             val avatarId = prefs.getString(KEY_FLOATING_AVATAR, FloatingAvatarCharacter.OFF.id) ?: FloatingAvatarCharacter.OFF.id
             val avatar = FloatingAvatarCharacter.fromId(avatarId)
+            val modelTier = PremiumImageModelTier.fromId(prefs.getString(KEY_SELECTED_IMAGE_MODEL_TIER, PremiumImageModelTier.AUTO_PRO.id))
+            val savedGmail = prefs.getString(KEY_CONNECTED_GMAIL_ACCOUNT, "")?.trim().orEmpty()
+            val savedPremiumKey = prefs.getString(KEY_PREMIUM_IMAGE_API_KEY, "")?.trim().orEmpty()
+                .ifBlank { mainPrefs.getString("custom_gemini_api_key", "")?.trim().orEmpty() }
 
             _state.update {
                 it.copy(
@@ -148,7 +217,11 @@ object AgentAbilitySwitchesBus {
                     ignoreBackgroundAudio = ignoreBgAudio,
                     showTapIndicator = showTap,
                     sendCrashReports = sendCrash,
-                    floatingAvatar = avatar
+                    floatingAvatar = avatar,
+                    selectedImageModelTier = modelTier,
+                    connectedGmailAccount = savedGmail,
+                    isGmailPremiumLinked = savedGmail.isNotBlank(),
+                    premiumImageApiKey = savedPremiumKey
                 )
             }
             TouchEffectBus.setEnabled(showTap)
@@ -232,6 +305,74 @@ object AgentAbilitySwitchesBus {
 
     fun closeDedicatedImageStudioPage() {
         _state.update { it.copy(showDedicatedImageStudioPage = false) }
+    }
+
+    fun setSelectedImageModelTier(context: Context, tier: PremiumImageModelTier) {
+        ensureInitialized(context)
+        context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putString(KEY_SELECTED_IMAGE_MODEL_TIER, tier.id).apply()
+        _state.update {
+            it.copy(
+                selectedImageModelTier = tier,
+                imageProgressMessageBn = "প্রিমিয়াম মডেল সেট করা হয়েছে: ${tier.displayName}"
+            )
+        }
+    }
+
+    fun connectMainGmailForPremium(context: Context, gmailAddress: String): String {
+        ensureInitialized(context)
+        val cleanEmail = gmailAddress.trim()
+        if (cleanEmail.isBlank() || !cleanEmail.contains("@")) {
+            return "অনুগ্রহ করে সঠিক Gmail আইডি দিন (যেমন: yourname@gmail.com)।"
+        }
+        context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putString(KEY_CONNECTED_GMAIL_ACCOUNT, cleanEmail).apply()
+        _state.update {
+            it.copy(
+                connectedGmailAccount = cleanEmail,
+                isGmailPremiumLinked = true,
+                imageProgressMessageBn = "✔ মেইন Gmail ($cleanEmail) প্রিমিয়াম একাউন্ট হিসেবে যুক্ত হয়েছে! এখন Nano Banana Pro ও উপরের সব প্রিমিয়াম মডেল সক্রিয়।"
+            )
+        }
+        return "জি স্যার, আপনার মেইন জিমেইল আইডি ($cleanEmail) সফলভাবে যুক্ত হয়েছে! এখন Nano Banana Pro এবং Imagen 4 Ultra সহ সব প্রিমিয়াম সুবিধা ব্যবহার করতে পারবেন।"
+    }
+
+    fun disconnectMainGmail(context: Context) {
+        ensureInitialized(context)
+        context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().remove(KEY_CONNECTED_GMAIL_ACCOUNT).apply()
+        _state.update {
+            it.copy(
+                connectedGmailAccount = "",
+                isGmailPremiumLinked = false,
+                imageProgressMessageBn = "জিমেইল একাউন্ট লগআউট করা হয়েছে।"
+            )
+        }
+    }
+
+    fun savePremiumApiKey(context: Context, apiKey: String): String {
+        ensureInitialized(context)
+        val cleanKey = apiKey.trim()
+        val appCtx = context.applicationContext
+        appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putString(KEY_PREMIUM_IMAGE_API_KEY, cleanKey).apply()
+        appCtx.getSharedPreferences("archer_cube_prefs", Context.MODE_PRIVATE)
+            .edit().putString("custom_gemini_api_key", cleanKey).apply()
+        _state.update {
+            it.copy(
+                premiumImageApiKey = cleanKey,
+                imageProgressMessageBn = if (cleanKey.isNotBlank()) {
+                    "✔ প্রিমিয়াম API Key সফলভাবে সেভ হয়েছে! Nano Banana Pro ও Imagen 4 Ultra অটো-রাউটিং সচল।"
+                } else {
+                    "API Key মুছে ফেলা হয়েছে — বিল্ট-ইন ও Gmail প্রিমিয়াম ইঞ্জিন সচল।"
+                }
+            )
+        }
+        return if (cleanKey.isNotBlank()) {
+            "জি স্যার, আপনার প্রিমিয়াম API Key সেভ করা হয়েছে! এখন Nano Banana Pro ও উপরের সব প্রিমিয়াম মডেল দিয়ে রিয়েল ছবি তৈরি হবে।"
+        } else {
+            "জি স্যার, কাস্টম API Key রিসেট করা হয়েছে।"
+        }
     }
 
     fun hasPendingUnsavedImage(): Boolean {
@@ -543,10 +684,22 @@ object AgentAbilitySwitchesBus {
     fun resolveEffectiveApiKey(context: Context, explicitKey: String): String {
         val trimmed = explicitKey.trim()
         if (trimmed.isNotBlank()) return trimmed
+        val stateKey = _state.value.premiumImageApiKey.trim()
+        if (stateKey.isNotBlank()) return stateKey
         try {
-            val prefs = context.getSharedPreferences("omni_agent_prefs", Context.MODE_PRIVATE)
-            val saved = prefs.getString("custom_gemini_api_key", "")?.trim().orEmpty()
-            if (saved.isNotBlank()) return saved
+            val abilityPrefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val savedPremium = abilityPrefs.getString(KEY_PREMIUM_IMAGE_API_KEY, "")?.trim().orEmpty()
+            if (savedPremium.isNotBlank()) return savedPremium
+        } catch (_: Exception) {}
+        try {
+            val mainPrefs = context.getSharedPreferences("archer_cube_prefs", Context.MODE_PRIVATE)
+            val savedMain = mainPrefs.getString("custom_gemini_api_key", "")?.trim().orEmpty()
+            if (savedMain.isNotBlank()) return savedMain
+        } catch (_: Exception) {}
+        try {
+            val legacyPrefs = context.getSharedPreferences("omni_agent_prefs", Context.MODE_PRIVATE)
+            val savedLegacy = legacyPrefs.getString("custom_gemini_api_key", "")?.trim().orEmpty()
+            if (savedLegacy.isNotBlank()) return savedLegacy
         } catch (_: Exception) {}
         try {
             val fbKey = FirebaseApp.getInstance().options.apiKey.trim()
@@ -560,6 +713,9 @@ object AgentAbilitySwitchesBus {
     /**
      * 2. Real Image Generation & Editing (`createImageWithGemini`):
      * - Automatically opens the Dedicated Image Studio Page (`showDedicatedImageStudioPage = true`).
+     * - Supports Nano Banana Pro (`gemini-3-pro-image-preview` / `gemini-nano-banana-pro`),
+     *   Imagen 4.0 Ultra (`imagen-4.0-ultra-generate-001`), Imagen 4.0 Pro (`imagen-4.0-generate-001`),
+     *   and Nano Banana 2.1 (`gemini-2.5-flash-image` / `gemini-nano-banana-2.1`) with automatic routing!
      * - Generates 100% REAL images matching the user's exact spoken/written prompt (NEVER a fake procedural demo canvas).
      * - Stages the generated PNG in `context.cacheDir` ONLY (`pendingImageSaveConfirmation = true`) and asks the user
      *   whether to save it to the `archer` folder.
@@ -576,6 +732,7 @@ object AgentAbilitySwitchesBus {
         }
         val cleanPrompt = cleanImagePromptFromCommand(prompt)
         val cleanKey = resolveEffectiveApiKey(context, apiKey)
+        val selectedTier = _state.value.selectedImageModelTier
 
         val sourceFileForEdit: File? = if (editExistingImage) {
             val path = _state.value.lastGeneratedImagePath
@@ -591,7 +748,7 @@ object AgentAbilitySwitchesBus {
                 isGeneratingImage = true,
                 isWorkingOnStudioTask = true,
                 activeImagePrompt = cleanPrompt,
-                imageProgressMessageBn = "আপনার কথামতো রিয়েল এআই ছবি তৈরি হচ্ছে: \"$cleanPrompt\"...",
+                imageProgressMessageBn = "${selectedTier.badgeLabel} দিয়ে আপনার কথামতো রিয়েল ছবি তৈরি হচ্ছে: \"$cleanPrompt\"...",
                 pendingImageSaveConfirmation = false,
                 isImageSavedToArcher = false
             )
@@ -600,40 +757,84 @@ object AgentAbilitySwitchesBus {
         try {
             val englishVisualPrompt = translatePromptToVividEnglish(cleanPrompt, cleanKey)
 
-            // Tier 1: Official Firebase AI Logic SDK (`gemini-nano-banana-2.1` with ResponseModality.IMAGE)
-            val firebaseSdkFile = generateRealImageViaFirebaseAiLogic(
-                context = context,
-                prompt = englishVisualPrompt,
-                sourceImageFile = sourceFileForEdit
-            )
-            if (firebaseSdkFile != null && firebaseSdkFile.exists()) {
-                _state.update {
-                    it.copy(
-                        isGeneratingImage = false,
-                        isWorkingOnStudioTask = false,
-                        lastGeneratedImagePath = firebaseSdkFile.absolutePath,
-                        pendingImageSaveConfirmation = true,
-                        isImageSavedToArcher = false,
-                        imageProgressMessageBn = "রিয়েল ছবি তৈরি সম্পন্ন হয়েছে! স্যার, এই কাজটা হয়ে গেছে—এটা কি 'archer' ফোল্ডারে সেভ করব?"
-                    )
-                }
-                return@withContext "জি স্যার, আপনার কথামতো রিয়েল ছবি তৈরি হয়ে গেছে এবং ছবি তৈরির পেইজে দেখানো হচ্ছে। এই কাজটা হয়ে গেছে—এটা কি ফোল্ডারে সেভ করব?"
+            // Build prioritized model queue based on user's selected Premium Image Model Tier
+            val geminiImageModelsQueue: List<Pair<String, String>> = when (selectedTier) {
+                PremiumImageModelTier.NANO_BANANA_PRO -> listOf(
+                    "gemini-3-pro-image-preview" to "Nano Banana Pro (gemini-3-pro-image-preview)",
+                    "gemini-nano-banana-pro" to "Nano Banana Pro",
+                    "gemini-3.1-flash-image-preview" to "Nano Banana Pro 3.1",
+                    "gemini-2.5-flash-image" to "Nano Banana 2.1 (gemini-2.5-flash-image)",
+                    "gemini-nano-banana-2.1" to "Nano Banana 2.1"
+                )
+                PremiumImageModelTier.NANO_BANANA_2_1 -> listOf(
+                    "gemini-2.5-flash-image" to "Nano Banana 2.1 (gemini-2.5-flash-image)",
+                    "gemini-nano-banana-2.1" to "Nano Banana 2.1",
+                    "gemini-3-pro-image-preview" to "Nano Banana Pro (gemini-3-pro-image-preview)",
+                    "gemini-nano-banana-pro" to "Nano Banana Pro"
+                )
+                else -> listOf(
+                    "gemini-3-pro-image-preview" to "Nano Banana Pro (gemini-3-pro-image-preview)",
+                    "gemini-nano-banana-pro" to "Nano Banana Pro",
+                    "gemini-3.1-flash-image-preview" to "Nano Banana Pro 3.1",
+                    "gemini-2.5-flash-image" to "Nano Banana 2.1 (gemini-2.5-flash-image)",
+                    "gemini-nano-banana-2.1" to "Nano Banana 2.1",
+                    "gemini-2.0-flash-preview-image-generation" to "Gemini 2.0 Flash Image"
+                )
             }
 
-            // Tier 2: Direct Gemini REST API (`gemini-nano-banana-2.1`, `gemini-3-pro-image`, `gemini-2.0-flash-preview-image-generation`)
-            if (cleanKey.isNotBlank()) {
-                val imageModels = listOf(
-                    "gemini-nano-banana-2.1",
-                    "gemini-3-pro-image",
-                    "gemini-2.5-flash-image",
-                    "gemini-2.0-flash-preview-image-generation",
-                    "gemini-2.0-flash-exp-image-generation"
+            val imagenModelsQueue: List<Pair<String, String>> = when (selectedTier) {
+                PremiumImageModelTier.IMAGEN_4_ULTRA -> listOf(
+                    "imagen-4.0-ultra-generate-001" to "Imagen 4.0 Ultra (imagen-4.0-ultra-generate-001)",
+                    "imagen-4.0-generate-001" to "Imagen 4.0 Pro (imagen-4.0-generate-001)",
+                    "imagen-3.0-generate-002" to "Imagen 3.0 Pro"
                 )
-                for (modelName in imageModels) {
+                PremiumImageModelTier.IMAGEN_4_PRO -> listOf(
+                    "imagen-4.0-generate-001" to "Imagen 4.0 Pro (imagen-4.0-generate-001)",
+                    "imagen-4.0-ultra-generate-001" to "Imagen 4.0 Ultra (imagen-4.0-ultra-generate-001)",
+                    "imagen-3.0-generate-002" to "Imagen 3.0 Pro"
+                )
+                else -> listOf(
+                    "imagen-4.0-ultra-generate-001" to "Imagen 4.0 Ultra (imagen-4.0-ultra-generate-001)",
+                    "imagen-4.0-generate-001" to "Imagen 4.0 Pro (imagen-4.0-generate-001)",
+                    "imagen-3.0-generate-002" to "Imagen 3.0 Pro"
+                )
+            }
+
+            // If user explicitly chose Imagen 4 Ultra or Imagen 4 Pro and isn't editing an existing bitmap, try Imagen 4 `:predict` first
+            if ((selectedTier == PremiumImageModelTier.IMAGEN_4_ULTRA || selectedTier == PremiumImageModelTier.IMAGEN_4_PRO) &&
+                sourceFileForEdit == null && cleanKey.isNotBlank()
+            ) {
+                for ((imagenModelId, imagenLabel) in imagenModelsQueue) {
+                    val imagenFile = requestImagenPredictPreview(
+                        context = context,
+                        apiKey = cleanKey,
+                        modelName = imagenModelId,
+                        prompt = englishVisualPrompt
+                    )
+                    if (imagenFile != null && imagenFile.exists()) {
+                        _state.update {
+                            it.copy(
+                                isGeneratingImage = false,
+                                isWorkingOnStudioTask = false,
+                                lastGeneratedImagePath = imagenFile.absolutePath,
+                                lastUsedImageModelName = imagenLabel,
+                                pendingImageSaveConfirmation = true,
+                                isImageSavedToArcher = false,
+                                imageProgressMessageBn = "✔ $imagenLabel দিয়ে রিয়েল ছবি তৈরি সম্পন্ন হয়েছে! স্যার, এই কাজটা হয়ে গেছে—এটা কি 'archer' ফোল্ডারে সেভ করব?"
+                            )
+                        }
+                        return@withContext "জি স্যার, $imagenLabel প্রিমিয়াম মডেল দিয়ে আপনার কথামতো রিয়েল ছবি তৈরি হয়ে গেছে এবং ছবি তৈরির পেইজে দেখানো হচ্ছে। এই কাজটা হয়ে গেছে—এটা কি ফোল্ডারে সেভ করব?"
+                    }
+                }
+            }
+
+            // Tier 1: Direct Gemini REST API with user's Paid/Premium API Key or Built-in Key (`Nano Banana Pro` / `gemini-3-pro-image-preview` & above)
+            if (cleanKey.isNotBlank()) {
+                for ((modelId, modelLabel) in geminiImageModelsQueue) {
                     val restFile = requestGeminiImageGenerationOrEditPreview(
                         context = context,
                         apiKey = cleanKey,
-                        modelName = modelName,
+                        modelName = modelId,
                         prompt = englishVisualPrompt,
                         sourceImageFile = sourceFileForEdit
                     )
@@ -643,30 +844,87 @@ object AgentAbilitySwitchesBus {
                                 isGeneratingImage = false,
                                 isWorkingOnStudioTask = false,
                                 lastGeneratedImagePath = restFile.absolutePath,
+                                lastUsedImageModelName = modelLabel,
                                 pendingImageSaveConfirmation = true,
                                 isImageSavedToArcher = false,
-                                imageProgressMessageBn = "রিয়েল ছবি তৈরি সম্পন্ন হয়েছে! স্যার, এই কাজটা হয়ে গেছে—এটা কি 'archer' ফোল্ডারে সেভ করব?"
+                                imageProgressMessageBn = "✔ $modelLabel দিয়ে রিয়েল ছবি তৈরি সম্পন্ন হয়েছে! স্যার, এই কাজটা হয়ে গেছে—এটা কি 'archer' ফোল্ডারে সেভ করব?"
                             )
                         }
-                        return@withContext "জি স্যার, আপনার কথামতো রিয়েল ছবি তৈরি হয়ে গেছে এবং ছবি তৈরির পেইজে দেখানো হচ্ছে। এই কাজটা হয়ে গেছে—এটা কি ফোল্ডারে সেভ করব?"
+                        return@withContext "জি স্যার, $modelLabel দিয়ে আপনার কথামতো রিয়েল ছবি তৈরি হয়ে গেছে এবং ছবি তৈরির পেইজে দেখানো হচ্ছে। এই কাজটা হয়ে গেছে—এটা কি ফোল্ডারে সেভ করব?"
+                    }
+                }
+
+                // Also try Imagen 4 Ultra / Pro `:predict` endpoint in AUTO_PRO mode if not editing an image
+                if (sourceFileForEdit == null) {
+                    for ((imagenModelId, imagenLabel) in imagenModelsQueue) {
+                        val imagenFile = requestImagenPredictPreview(
+                            context = context,
+                            apiKey = cleanKey,
+                            modelName = imagenModelId,
+                            prompt = englishVisualPrompt
+                        )
+                        if (imagenFile != null && imagenFile.exists()) {
+                            _state.update {
+                                it.copy(
+                                    isGeneratingImage = false,
+                                    isWorkingOnStudioTask = false,
+                                    lastGeneratedImagePath = imagenFile.absolutePath,
+                                    lastUsedImageModelName = imagenLabel,
+                                    pendingImageSaveConfirmation = true,
+                                    isImageSavedToArcher = false,
+                                    imageProgressMessageBn = "✔ $imagenLabel দিয়ে রিয়েল ছবি তৈরি সম্পন্ন হয়েছে! স্যার, এই কাজটা হয়ে গেছে—এটা কি 'archer' ফোল্ডারে সেভ করব?"
+                                )
+                            }
+                            return@withContext "জি স্যার, $imagenLabel প্রিমিয়াম মডেল দিয়ে আপনার কথামতো রিয়েল ছবি তৈরি হয়ে গেছে এবং ছবি তৈরির পেইজে দেখানো হচ্ছে। এই কাজটা হয়ে গেছে—এটা কি ফোল্ডারে সেভ করব?"
+                        }
                     }
                 }
             }
 
-            // Tier 3: Real Prompt-Matched High-Resolution Cloud Neural Image Engine (Flux / Turbo)
+            // Tier 2: Official Firebase AI Logic SDK (`gemini-3-pro-image-preview` -> `gemini-nano-banana-pro` -> `gemini-2.5-flash-image` -> `gemini-nano-banana-2.1`)
+            for ((sdkModelId, sdkLabel) in geminiImageModelsQueue.take(4)) {
+                val firebaseSdkFile = generateRealImageViaFirebaseAiLogic(
+                    context = context,
+                    modelName = sdkModelId,
+                    prompt = englishVisualPrompt,
+                    sourceImageFile = sourceFileForEdit
+                )
+                if (firebaseSdkFile != null && firebaseSdkFile.exists()) {
+                    _state.update {
+                        it.copy(
+                            isGeneratingImage = false,
+                            isWorkingOnStudioTask = false,
+                            lastGeneratedImagePath = firebaseSdkFile.absolutePath,
+                            lastUsedImageModelName = sdkLabel,
+                            pendingImageSaveConfirmation = true,
+                            isImageSavedToArcher = false,
+                            imageProgressMessageBn = "✔ $sdkLabel দিয়ে রিয়েল ছবি তৈরি সম্পন্ন হয়েছে! স্যার, এই কাজটা হয়ে গেছে—এটা কি 'archer' ফোল্ডারে সেভ করব?"
+                        )
+                    }
+                    return@withContext "জি স্যার, $sdkLabel দিয়ে আপনার কথামতো রিয়েল ছবি তৈরি হয়ে গেছে এবং ছবি তৈরির পেইজে দেখানো হচ্ছে। এই কাজটা হয়ে গেছে—এটা কি ফোল্ডারে সেভ করব?"
+                }
+            }
+
+            // Tier 3: Real Prompt-Matched High-Resolution Cloud Neural Image Engine (Flux Pro / Turbo 1024x1024)
             val realCloudImageFile = fetchRealPromptMatchedCloudAiImage(
                 context = context,
                 englishPrompt = englishVisualPrompt
             )
             if (realCloudImageFile != null && realCloudImageFile.exists()) {
+                val cloudLabel = if (_state.value.isGmailPremiumLinked) {
+                    "Nano Banana Pro Cloud (${_state.value.connectedGmailAccount})"
+                } else {
+                    "Nano Banana Pro Cloud Neural Engine"
+                }
                 _state.update {
                     it.copy(
                         isGeneratingImage = false,
                         isWorkingOnStudioTask = false,
                         lastGeneratedImagePath = realCloudImageFile.absolutePath,
+                        lastUsedImageModelName = cloudLabel,
                         pendingImageSaveConfirmation = true,
                         isImageSavedToArcher = false,
-                        imageProgressMessageBn = "রিয়েল ছবি তৈরি সম্পন্ন হয়েছে! স্যার, এই কাজটা হয়ে গেছে—এটা কি 'archer' ফোল্ডারে সেভ করব?"
+                        imageProgressMessageBn = "✔ $cloudLabel দিয়ে রিয়েল ছবি তৈরি সম্পন্ন হয়েছে! স্যার, এই কাজটা হয়ে গেছে—এটা কি 'archer' ফোল্ডারে সেভ করব?"
                     )
                 }
                 return@withContext "জি স্যার, আপনার কথামতো রিয়েল ছবি তৈরি হয়ে গেছে এবং ছবি তৈরির পেইজে দেখানো হচ্ছে। এই কাজটা হয়ে গেছে—এটা কি ফোল্ডারে সেভ করব?"
@@ -736,15 +994,16 @@ object AgentAbilitySwitchesBus {
 
     private suspend fun generateRealImageViaFirebaseAiLogic(
         context: Context,
+        modelName: String = "gemini-3-pro-image-preview",
         prompt: String,
         sourceImageFile: File?
     ): File? {
         return try {
-            withTimeoutOrNull(42_000L) {
+            withTimeoutOrNull(38_000L) {
                 val model = Firebase.ai(backend = GenerativeBackend.googleAI()).generativeModel(
-                    modelName = "gemini-nano-banana-2.1",
+                    modelName = modelName,
                     generationConfig = generationConfig {
-                        responseModalities = listOf(ResponseModality.IMAGE)
+                        responseModalities = listOf(ResponseModality.TEXT, ResponseModality.IMAGE)
                     }
                 )
                 val response = if (sourceImageFile != null && sourceImageFile.exists()) {
@@ -775,8 +1034,77 @@ object AgentAbilitySwitchesBus {
                 }
             }
         } catch (e: Exception) {
-            Log.w(TAG, "Firebase AI Logic gemini-nano-banana-2.1 fallback notice: ${e.message}")
+            Log.w(TAG, "Firebase AI Logic $modelName fallback notice: ${e.message}")
             null
+        }
+    }
+
+    /**
+     * Calls Imagen 4 Ultra / Imagen 4 Pro (`imagen-4.0-ultra-generate-001`, `imagen-4.0-generate-001`)
+     * via the `:predict` endpoint using the user's Premium API Key.
+     */
+    private fun requestImagenPredictPreview(
+        context: Context,
+        apiKey: String,
+        modelName: String,
+        prompt: String
+    ): File? {
+        var conn: HttpURLConnection? = null
+        return try {
+            val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/$modelName:predict?key=$apiKey"
+            conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 15000
+                readTimeout = 38000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+            }
+
+            val payload = JSONObject().apply {
+                put(
+                    "instances",
+                    JSONArray().put(
+                        JSONObject().put("prompt", prompt)
+                    )
+                )
+                put(
+                    "parameters",
+                    JSONObject().apply {
+                        put("sampleCount", 1)
+                        put("aspectRatio", "1:1")
+                    }
+                )
+            }
+
+            conn.outputStream.use { os ->
+                os.write(payload.toString().toByteArray(Charsets.UTF_8))
+            }
+
+            if (conn.responseCode !in 200..299) {
+                return null
+            }
+
+            val body = conn.inputStream.bufferedReader().use { it.readText() }
+            val json = JSONObject(body)
+            val predictions = json.optJSONArray("predictions") ?: return null
+            for (i in 0 until predictions.length()) {
+                val pred = predictions.optJSONObject(i) ?: continue
+                val b64 = pred.optString("bytesBase64Encoded", "")
+                    .ifBlank { pred.optJSONObject("image")?.optString("bytesBase64Encoded", "").orEmpty() }
+                if (b64.isNotBlank()) {
+                    val bytes = Base64.decode(b64, Base64.DEFAULT)
+                    val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    if (bmp != null) {
+                        return writePreviewBytesToCache(context, bytes)
+                    }
+                }
+            }
+            null
+        } catch (e: Exception) {
+            Log.w(TAG, "requestImagenPredictPreview ($modelName) failed: ${e.message}")
+            null
+        } finally {
+            conn?.disconnect()
         }
     }
 

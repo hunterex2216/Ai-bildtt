@@ -205,6 +205,11 @@ class OmniAgentViewModel(application: Application) : AndroidViewModel(applicatio
         )
         multimodalLiveService.setToolCallHandler { tag -> executeLiveToolTag(tag) }
         multimodalLiveService.setNamedToolHandler { name, args -> executeNamedLiveTool(name, args) }
+        multimodalLiveService.setOnUserTurnCompleteForMemory { userUtterance, aiReply ->
+            viewModelScope.launch {
+                evaluateAndSaveMemoryFromUserInput(userUtterance, aiReply)
+            }
+        }
     }
 
     fun isMainScreenShareActive(): Boolean {
@@ -573,6 +578,31 @@ class OmniAgentViewModel(application: Application) : AndroidViewModel(applicatio
                 _liveArcherReply.value = msg
                 msg
             }
+            "save_user_memory" -> {
+                val title = args.optString("title").trim().ifBlank { "স্যারের গুরুত্বপূর্ণ মেমোরি" }
+                val content = args.optString("content").trim()
+                val category = args.optString("category").trim().ifBlank { "EXPLICIT_USER_MEMORY" }
+                if (content.isBlank()) return "missing memory content"
+                val existing = historyRepo.memoryNotesFlow.first()
+                val alreadyExists = existing.any {
+                    it.content.equals(content, ignoreCase = true) ||
+                        (it.title.equals(title, ignoreCase = true) && it.content.contains(content, ignoreCase = true))
+                }
+                if (!alreadyExists) {
+                    historyRepo.saveMemoryNote(
+                        title = title,
+                        content = content,
+                        category = category
+                    )
+                }
+                val updated = historyRepo.memoryNotesFlow.first()
+                com.example.service.SmartMemoryAndSelfUpdateEngine.syncLiveMemoryNotesSummary(
+                    updated.map { "${it.title}: ${it.content} [${it.category}]" }
+                )
+                val confirmBn = "জি স্যার, আমি মেমোরিতে সেভ করে রেখেছি: '$title — $content'।"
+                _liveArcherReply.value = confirmBn
+                "SAVED_TO_LONG_TERM_MEMORY: '$title' -> '$content' [$category]"
+            }
             else -> "unknown tool"
         }
     }
@@ -758,6 +788,15 @@ class OmniAgentViewModel(application: Application) : AndroidViewModel(applicatio
 
         viewModelScope.launch {
             seedInitialDataIfEmpty()
+        }
+
+        // Continuously sync saved Room Memory Notes into SmartMemoryAndSelfUpdateEngine so Gemini Live always remembers them
+        viewModelScope.launch {
+            historyRepo.memoryNotesFlow.collect { notes ->
+                com.example.service.SmartMemoryAndSelfUpdateEngine.syncLiveMemoryNotesSummary(
+                    notes.map { "${it.title}: ${it.content} [${it.category}]" }
+                )
+            }
         }
 
         // Listen for wake-word events ("Hey Cube", "Archer", "Jarvis", etc.) to wake up if powered off
@@ -1190,12 +1229,14 @@ class OmniAgentViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun updateGeminiApiKey(newKey: String) {
         val cleaned = newKey.trim()
+        val ctx = getApplication<Application>().applicationContext
         prefs.edit().putString(KEY_CUSTOM_GEMINI_API_KEY, cleaned).apply()
+        com.example.service.AgentAbilitySwitchesBus.savePremiumApiKey(ctx, cleaned)
         _geminiApiKeyState.value = cleaned
         _isAgentPoweredOff.value = false
         multimodalLiveService.refreshExportConfig(cleaned)
         multimodalLiveService.startLiveSession(cleaned)
-        _liveArcherReply.value = "জি স্যার, Gemini Live কানেক্ট হচ্ছে..."
+        _liveArcherReply.value = "জি স্যার, প্রিমিয়াম API Key সেভ হয়েছে এবং Gemini Live ও Nano Banana Pro কানেক্ট হচ্ছে..."
     }
 
     // 7 Ability Permission Switches (Screenshot UI Controls)
@@ -1499,30 +1540,39 @@ class OmniAgentViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    private suspend fun evaluateAndSaveMemoryFromUserInput(userUtterance: String, aiReply: String = "") {
+        val cleanUser = userUtterance.trim()
+        if (cleanUser.isBlank()) return
+        val decision = com.example.service.SmartMemoryAndSelfUpdateEngine.evaluateWorthRemembering(
+            userUtterance = cleanUser,
+            aiReply = aiReply
+        )
+        if (decision.shouldSave && decision.extractedContent.isNotBlank()) {
+            val existing = historyRepo.memoryNotesFlow.first()
+            val alreadySaved = existing.any {
+                it.content.equals(decision.extractedContent, ignoreCase = true) ||
+                    (it.title.equals(decision.extractedTitle, ignoreCase = true) &&
+                        it.content.equals(decision.extractedContent, ignoreCase = true))
+            }
+            if (!alreadySaved) {
+                historyRepo.saveMemoryNote(
+                    title = decision.extractedTitle,
+                    content = decision.extractedContent,
+                    category = decision.category
+                )
+                val updated = historyRepo.memoryNotesFlow.first()
+                com.example.service.SmartMemoryAndSelfUpdateEngine.syncLiveMemoryNotesSummary(
+                    updated.map { "${it.title}: ${it.content} [${it.category}]" }
+                )
+            }
+        } else if (cleanUser.length > 3) {
+            com.example.service.SmartMemoryAndSelfUpdateEngine.incrementFilteredJunkCount()
+        }
+    }
+
     private suspend fun autoEvaluateAndSaveSmartMemory(userUtterance: String, plan: AgentPlanResponse) {
         val cleanUser = userUtterance.trim()
-        if (cleanUser.isNotBlank()) {
-            val decision = com.example.service.SmartMemoryAndSelfUpdateEngine.evaluateWorthRemembering(
-                userUtterance = cleanUser,
-                aiReply = plan.spokenReply
-            )
-            if (decision.shouldSave && decision.extractedContent.isNotBlank()) {
-                val existing = historyRepo.memoryNotesFlow.first()
-                val alreadySaved = existing.any {
-                    it.content.equals(decision.extractedContent, ignoreCase = true) ||
-                        it.title.equals(decision.extractedTitle, ignoreCase = true)
-                }
-                if (!alreadySaved) {
-                    historyRepo.saveMemoryNote(
-                        title = decision.extractedTitle,
-                        content = decision.extractedContent,
-                        category = decision.category
-                    )
-                }
-            } else if (cleanUser.length > 3) {
-                com.example.service.SmartMemoryAndSelfUpdateEngine.incrementFilteredJunkCount()
-            }
-        }
+        evaluateAndSaveMemoryFromUserInput(cleanUser, plan.spokenReply)
         if (plan.steps.isNotEmpty()) {
             val stepDescriptions = plan.steps.map { s ->
                 "${s.actionType.name}: ${s.title}"
@@ -2078,6 +2128,9 @@ class OmniAgentViewModel(application: Application) : AndroidViewModel(applicatio
 
         _liveUserTranscript.value = rawTrimmed
         detectAndApplyInlineRuleLock(rawTrimmed)
+        viewModelScope.launch {
+            evaluateAndSaveMemoryFromUserInput(rawTrimmed, "")
+        }
 
         // 1. Check if there is a pending unsaved image, code, or music track waiting for user's Save/Discard confirmation
         val hasAnyPendingSave = com.example.service.AgentAbilitySwitchesBus.hasPendingUnsavedImage() ||

@@ -267,9 +267,18 @@ object SmartMemoryAndSelfUpdateEngine {
         return imperativeOrQuestion || isTaskCurrentlyActive
     }
 
+    @Volatile
+    private var syncedUserMemoryLines: List<String> = emptyList()
+
+    fun syncLiveMemoryNotesSummary(memoryLines: List<String>) {
+        syncedUserMemoryLines = memoryLines.take(40)
+    }
+
     /**
      * AI Smart Memory Relevance Filter:
      * Decides automatically what is worth saving in long-term memory vs. what is trivial noise.
+     * Supports both explicit "remember this" commands AND automatic detection of important personal facts,
+     * contacts, preferences, routines, project names, and instructions.
      */
     fun evaluateWorthRemembering(userUtterance: String, aiReply: String = ""): MemoryRelevanceDecision {
         val cleanPrompt = userUtterance.trim()
@@ -279,31 +288,49 @@ object SmartMemoryAndSelfUpdateEngine {
         // 1. Ignore casual greetings, one-word fillers, or temporary status checks
         val trivialPatterns = listOf(
             "হ্যালো", "হাই", "hello", "hi", "hey", "কেমন আছো", "কয়টা বাজে", "সময় কত",
-            "ব্যাটারি কত", "ওকে", "আচ্ছা", "ধন্যবাদ", "thanks", "thank you", "হুম", "জি"
+            "ব্যাটারি কত", "ওকে", "আচ্ছা", "ধন্যবাদ", "thanks", "thank you", "হুম", "জি",
+            "হ্যাঁ সেভ করো", "সেভ করো", "না লাগবে না", "বাদ দাও"
         )
         if (trivialPatterns.any { lower == it || (lower.length < 14 && lower.startsWith(it)) }) {
             return MemoryRelevanceDecision(shouldSave = false)
         }
 
-        // 2. Explicit user request to remember something ("মনে রেখো", "মনে রাখবে", "মাথায় রেখো", "remember")
+        // 2. Explicit user request to remember something ("মনে রেখো", "মনে রাখবে", "মনে রাখো", "মাথায় রেখো", "remember")
         val isExplicitRemember = lower.contains("মনে রেখ") ||
             lower.contains("মনে রাখ") ||
+            lower.contains("মনে রাইখ") ||
             lower.contains("মাথায় রেখ") ||
             lower.contains("মাথায় রেখ") ||
+            lower.contains("মাথায় রাখ") ||
+            lower.contains("মাথায় রাখ") ||
             lower.contains("সেভ করে রাখ") ||
+            lower.contains("লিখে রাখ") ||
+            lower.contains("নোট করে রাখ") ||
+            lower.contains("মেমোরিতে রাখ") ||
+            lower.contains("মেমোরিতে সেভ") ||
+            lower.contains("মেমুরিতে রাখ") ||
+            lower.contains("মেমুরিতে সেভ") ||
             lower.contains("ভুলে যেও না") ||
-            lower.contains("remember that") ||
+            lower.contains("ভুলে যাওয়া যাবে না") ||
+            lower.contains("মনে থাকে যেন") ||
+            lower.contains("remember") ||
+            lower.contains("memorize") ||
             lower.contains("keep in mind") ||
-            lower.contains("don't forget")
+            lower.contains("don't forget") ||
+            lower.contains("save to memory") ||
+            lower.contains("note that")
 
         if (isExplicitRemember) {
             val strippedFact = cleanPrompt
-                .replace(Regex("(?i)(একটা কথা|এই কথাটা|এটা|তুমি|সবসময়|মনে রেখো|মনে রাখবে|মনে রাখো|মাথায় রেখো|মাথায় রাখবে|ভুলে যেও না|remember that|keep in mind|please)\\s*[:,]?\\s*"), "")
+                .replace(
+                    Regex("(?i)(একটা কথা|এই কথাটা|এটা|তুমি|সবসময়|মনে রেখো|মনে রাখবে|মনে রাখো|মনে রাইখো|মাথায় রেখো|মাথায় রাখবে|মাথায় রাখো|সেভ করে রাখো|লিখে রাখো|নোট করে রাখো|মেমোরিতে রাখো|মেমুরিতে রাখো|ভুলে যেও না|মনে থাকে যেন|remember that|remember|memorize|keep in mind|don't forget|please)\\s*[:,।-]?\\s*"),
+                    ""
+                )
                 .trim()
                 .ifBlank { cleanPrompt }
             return MemoryRelevanceDecision(
                 shouldSave = true,
-                extractedTitle = "স্যারের বলা গুরুত্বপূর্ণ তথ্য",
+                extractedTitle = "স্যারের বলা গুরুত্বপূর্ণ মেমোরি: ${strippedFact.take(28)}",
                 extractedContent = strippedFact,
                 category = "USER_MEMORY"
             )
@@ -313,25 +340,69 @@ object SmartMemoryAndSelfUpdateEngine {
             return MemoryRelevanceDecision(shouldSave = false)
         }
 
-        // 3. Autonomous AI detection of personal facts, preferences, favorite channels/contacts, or standing habits
+        // 3. Autonomous AI detection of personal facts, family/friends, preferences, favorite channels/contacts, project info, or habits
         val isPersonalPreferenceOrFact = lower.contains("আমার নাম") ||
+            lower.contains("আমার ডাকনাম") ||
+            lower.contains("আমার বয়স") ||
+            lower.contains("আমার বাসা") ||
+            lower.contains("আমার বাড়ি") ||
+            lower.contains("আমার বাড়ি") ||
+            lower.contains("আমার গ্রাম") ||
+            lower.contains("আমার শহর") ||
+            lower.contains("আমার অফিস") ||
+            lower.contains("আমার স্কুল") ||
+            lower.contains("আমার কলেজ") ||
+            lower.contains("আমার ভার্সিটি") ||
             lower.contains("আমার প্রিয়") ||
+            lower.contains("আমার প্রিয়") ||
             lower.contains("আমার পছন্দ") ||
+            lower.contains("আমার ভালো লাগে") ||
+            lower.contains("আমি ভালোবাসি") ||
             lower.contains("আমি প্রতিদিন") ||
+            lower.contains("আমার রুটিন") ||
             lower.contains("আমার নম্বর") ||
+            lower.contains("আমার নাম্বার") ||
+            lower.contains("আমার ফোন") ||
             lower.contains("আমার ইমেইল") ||
+            lower.contains("আমার জিমেইল") ||
             lower.contains("আমার চ্যানেল") ||
             lower.contains("আমার আইডি") ||
+            lower.contains("আমার পাসওয়ার্ড") ||
+            lower.contains("আমার পিন") ||
+            lower.contains("আমার কোড") ||
+            lower.contains("আমার প্রজেক্ট") ||
+            lower.contains("আমার ব্যবসা") ||
+            lower.contains("আমার কাজ") ||
+            lower.contains("আমার বন্ধু") ||
+            lower.contains("আমার ভাই") ||
+            lower.contains("আমার বোন") ||
+            lower.contains("আমার আম্মু") ||
+            lower.contains("আমার আব্বু") ||
+            lower.contains("আমার মা") ||
+            lower.contains("আমার বাবা") ||
+            lower.contains("আমার জন্মদিন") ||
+            lower.contains("আমি থাকি") ||
+            lower.contains("আমি কাজ করি") ||
             lower.contains("সবসময় এভাবে") ||
+            lower.contains("যখনই আমি বলব") ||
             lower.contains("my favorite") ||
             lower.contains("my name is") ||
+            lower.contains("my email") ||
+            lower.contains("my phone") ||
+            lower.contains("my number") ||
+            lower.contains("my project") ||
+            lower.contains("my birthday") ||
+            lower.contains("my address") ||
+            lower.contains("i live in") ||
+            lower.contains("i work at") ||
             lower.contains("i prefer") ||
+            lower.contains("i like") ||
             lower.contains("always do")
 
         if (isPersonalPreferenceOrFact) {
             return MemoryRelevanceDecision(
                 shouldSave = true,
-                extractedTitle = "AI অটো-শনাক্তকৃত পছন্দ ও তথ্য",
+                extractedTitle = "AI অটো-শনাক্তকৃত তথ্য: ${cleanPrompt.take(28)}",
                 extractedContent = cleanPrompt,
                 category = "AI_AUTO_LEARNED"
             )
@@ -643,8 +714,8 @@ object SmartMemoryAndSelfUpdateEngine {
     }
 
     /**
-     * Builds the HIGHEST-PRIORITY Main System Core Promoted Prompt Block injected into Gemini Live & Argon-4
-     * so any self-update commanded by the user permanently overrides default system behavior!
+     * Builds the HIGHEST-PRIORITY Main System Core Promoted Prompt Block + Saved Long-Term User Memories
+     * injected into Gemini Live & Argon-4 so any self-update or remembered fact is always active!
      */
     fun buildEvolutionContextForPrompt(): String = buildString {
         val snap = _state.value
@@ -660,6 +731,13 @@ object SmartMemoryAndSelfUpdateEngine {
                 append(" -> DIRECTIVE: ${patch.behaviorDirective}\n")
             }
             append("=== END OF MAIN SYSTEM CORE PROMOTED DIRECTIVES ===\n")
+        }
+        if (syncedUserMemoryLines.isNotEmpty()) {
+            append("\n=== SIR'S SAVED LONG-TERM MEMORIES & PERSONAL FACTS (ALWAYS REMEMBER & USE WHEN RELEVANT) ===\n")
+            syncedUserMemoryLines.forEachIndexed { idx, line ->
+                append("${idx + 1}. $line\n")
+            }
+            append("=== END OF SAVED LONG-TERM MEMORIES ===\n")
         }
         if (snap.learnedPlaybooks.isNotEmpty()) {
             append("\nLEARNED TASK WORKFLOW PLAYBOOKS (FOLLOW THESE EXACT PROVEN STEPS FAST):\n")
